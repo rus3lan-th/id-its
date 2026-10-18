@@ -1,0 +1,36 @@
+services:
+  id-nvk:
+    build: .
+    container_name: id-nvk-mvp
+    restart: unless-stopped
+    environment:
+      APP_DB_PATH: /data/id_nvk.sqlite3
+      APP_USER: ${APP_USER:?Set APP_USER in .env}
+      APP_PASSWORD_HASH: ${APP_PASSWORD_HASH:?Set APP_PASSWORD_HASH in .env}
+    volumes:
+      - id_nvk_data:/data
+      - ./seeds:/seeds:ro
+      - ./inbox:/data/inbox:ro
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: id-its-tunnel
+    restart: unless-stopped
+    command:
+      - tunnel
+      - --no-autoupdate
+      - --url
+      - http://id-nvk:8000
+    depends_on:
+      id-nvk:
+        condition: service_healthy
+
+volumes:
+  id_nvk_data:

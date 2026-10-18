@@ -1,0 +1,36 @@
+# секреты
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+# данные и базы
+data/
+*.sqlite3
+*.sqlite3.gz
+*.db
+backup-*/
+*.bak
+*.bak.*
+app_backups/
+app_override/
+files/
+photos/
+mail.json
+seeds/*.json
+inbox/*
+!inbox/.gitkeep
+# окружение и сборка
+__pycache__/
+*.pyc
+.venv/
+venv/
+node_modules/
+dist/
+build/
+# большие исходники проектов
+*.dxf
+*.dwg
+*.zip
+*.rar
