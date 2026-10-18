@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import json
 import collections
+import math
 import os
 import time
 import sqlite3
@@ -36,7 +37,7 @@ from pydantic import BaseModel, Field
 
 DB_PATH = Path(os.getenv("APP_DB_PATH", "/data/id_nvk.sqlite3"))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-app = FastAPI(title="ИД ИТС · НВК", version="2026.10.18.91")
+app = FastAPI(title="ИД ИТС · НВК", version="2026.10.18.92")
 
 
 # ---------- Доступ: логин и пароль (HTTP Basic), пароль хранится только в виде хеша ----------
@@ -3696,6 +3697,10 @@ def backup_full(request: Request) -> StreamingResponse:
 
 # ---------------------------------------------------------------- Что нового (окно после обновления программы)
 RELEASE_NOTES: list[tuple[str, list[str]]] = [
+    ("2026.10.18.92", ["Мастер 2.0, сверка материалов: потери по умолчанию берутся из сметных нормативов — для труб из нормы ГЭСН той работы сметы, к которой относится труба (например, 23-01-033-03: 102,5 м труб на 100 м — потери 2,5 %), при отсутствии нормы — РДС 82-202-96 прил. З (наружные сети: пластмассовые 2,5 %, стальные сварные 1 %, чугунные, керамические, асбестоцементные и железобетонные 2 %); для колец, плит, люков и решёток — 0 % (в ГЭСН 23-03 они «по проекту», РДС 82-202-96 п. 5.2). У каждого значения указан источник; значение можно исправить, исправленное помечается.",
+                       "Кольца стеновые колодцев (КС10/15/20 .3/.6/.9) считаются по глубине колодца: высота стенки = глубина − «верх» (люк, опорное кольцо, плита перекрытия; задаётся в шаблоне) с допуском 5 см, набирается кольцами .9 и одним .6 или .3. Колодцы без глубины в проекте отмечаются — кольца по ним не придумываются, расхождение показывается как «проект неполный».",
+                       "Шаблоны изделий для колодцев Ø1000, Ø1500, Ø2000, дождеприёмных и для колодцев без указания типа: им присваивается преобладающий тип колодцев той же сети (с пометкой «принято»). Если у колодца есть состав из таблицы колодцев проекта — берётся он. Шаблоны редактируются в «Порог и потери…».",
+                       "Справка по замечаниям — кнопка «В Google Таблицу»: таблица копируется в буфер и открывается новая Google Таблица, остаётся вставить (Ctrl+V)."]),
     ("2026.10.18.91", ["Мастер «Перечень работ» 2.0: подшаг 1.1 «Нормативы» — библиотека по умолчанию для НВК (СП 129.13330.2019, СП 31.13330.2021, СП 32.13330.2018, СП 8.13130.2020, ГОСТ 21.704-2011, ПП РФ №87; редактируется) и ссылки, найденные в чертежах DXF.",
                        "Подшаг 1.3 «Материалы»: ведомость материалов по перечню (трубы — по длинам участков, изделия колодцев — по типу колодца) и упоминаниям в DXF; количество можно поправить.",
                        "Подшаг 1.4 «Замечания и сверка»: сверка материалов проекта со сметой (по ведомости, порог 3 %, с учётом потерь) — расхождения сразу становятся замечаниями; справка замечаний с трудоёмкостью в чел.-ч, выгрузка в CSV для Google Таблиц.",
@@ -6635,13 +6640,23 @@ WZ2_REMARK_TYPES = {"contradiction": "противоречие", "missing": "о�
                     "estimate": "расхождение проект–смета", "replace": "предложение по замене", "other": "прочее"}
 WZ2_REMARK_STATUS = {"open": "открыто", "clarify": "уточняется", "accepted": "учтено в перечне", "dropped": "снято"}
 # материалы на один объект по типу (решение ПТО может поменять в параметрах раздела, ключ mat_templates)
-WZ2_MAT_TEMPLATES = [
-    {"match": r"(?i)колод.*(1500|1,5)", "items": [["жби|ПН15", "Плита днища ПН15", "шт", 1], ["жби|2ПП15", "Плита перекрытия 2ПП15", "шт", 1], ["люк", "Люк чугунный", "шт", 1]]},
-    {"match": r"(?i)дождеприём.*1000|дождеприем.*1000", "items": [["жби|ПН10", "Плита днища ПН10", "шт", 1], ["жби|КС10.9", "Кольцо стеновое КС10.9", "шт", 1],
-                                                                ["жби|КЦП2-10", "Плита перекрытия КЦП2-10", "шт", 1], ["решетка", "Решётка дождеприёмная", "шт", 1]]},
+WZ2_MAT_TEMPLATES = [   # порядок важен: первый подходящий; rings — серия стеновых колец по глубине, top_m — высота «верха» над стенкой (люк + опорное кольцо + плита)
+    {"label": "Колодец дождеприёмный Ø1000", "match": r"(?i)дожд\w*при[её]м.*1000|дк-?\d", "rings": "КС10", "top_m": 0.26,
+     "items": [["жби|ПН10", "Плита днища ПН10", "шт", 1], ["жби|КЦП2-10", "Плита перекрытия КЦП2-10", "шт", 1], ["решетка", "Решётка дождеприёмная", "шт", 1]]},
+    {"label": "Колодец ж/б Ø1500", "match": r"(?i)колод.*(1500|1,5\s*м)", "rings": "КС15", "top_m": 0.34,
+     "items": [["жби|ПН15", "Плита днища ПН15", "шт", 1], ["жби|2ПП15", "Плита перекрытия 2ПП15", "шт", 1], ["жби|КО6", "Кольцо опорное КО6", "шт", 1], ["люк", "Люк чугунный", "шт", 1]]},
+    {"label": "Колодец ж/б Ø2000", "match": r"(?i)колод.*(2000|2,0\s*м)", "rings": "КС20", "top_m": 0.34,
+     "items": [["жби|ПН20", "Плита днища ПН20", "шт", 1], ["жби|1ПП20", "Плита перекрытия 1ПП20", "шт", 1], ["жби|КО6", "Кольцо опорное КО6", "шт", 1], ["люк", "Люк чугунный", "шт", 1]]},
+    {"label": "Колодец ж/б Ø1000", "match": r"(?i)колод.*(1000|1,0\s*м)", "rings": "КС10", "top_m": 0.34,
+     "items": [["жби|ПН10", "Плита днища ПН10", "шт", 1], ["жби|1ПП10", "Плита перекрытия 1ПП10", "шт", 1], ["жби|КО6", "Кольцо опорное КО6", "шт", 1], ["люк", "Люк чугунный", "шт", 1]]},
 ]
-WZ2_PARAM_DEFAULT = {"threshold_pct": "3", "losses": json.dumps({"труба": 0, "жби": 0, "люк": 0, "решетка": 0, "прочее": 0}, ensure_ascii=False),
-                     "mat_templates": json.dumps(WZ2_MAT_TEMPLATES, ensure_ascii=False)}
+WZ2_WELL_CFG = {"tol_m": 0.05, "tray_m": 0.0}   # допуск набора колец; лоток над днищем (добавляется к высоте стенки)
+WZ2_PARAM_DEFAULT = {"threshold_pct": "3", "losses": "{}", "mat_templates": json.dumps(WZ2_MAT_TEMPLATES, ensure_ascii=False), "well_cfg": json.dumps(WZ2_WELL_CFG)}
+# нормы потерь, если в смете нет нормы ГЭСН с количеством труб (РДС 82-202-96, приложение З, раздел II — наружные сети)
+WZ2_RDS = "РДС 82-202-96, прил. З, разд. II (наружные сети)"
+WZ2_PIPE_LOSS = {"ПЭ": (2.5, "пластмассовые трубы"), "гофр.": (2.5, "пластмассовые трубы"), "НПВХ": (2.5, "пластмассовые трубы"), "сталь": (1.0, "сварные трубы"),
+                 "чугун": (2.0, "чугунные трубы"), "жб": (2.0, "железобетонные трубы"), "керамика": (2.0, "керамические трубы"), "асбест": (2.0, "асбестоцементные трубы")}
+WZ2_PIECE_LOSS_SRC = "0 %: в ГЭСН 23-03 сборные ж/б изделия и люки — «П» (по проекту, без потерь); РДС 82-202-96 п. 5.2 — готовые сборные изделия трудноустранимых потерь не дают"
 _NORM_RE = re.compile(r"(?<![А-Яа-яA-Za-z])(СП|СНиП|ГОСТ\s*Р|ГОСТ|ОСТ|ТУ|СанПиН|ВСН|ТПР|[Сс]ерия)\s*(\d[\d.]*(?:\s*[-–]\s*\d{2,})*)")
 
 
@@ -6879,26 +6894,55 @@ def wz2_normlib_del(request: Request, lid: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------- 1.3 Материалы
-def _wz2_mat_project(c: sqlite3.Connection, sec: Any) -> dict[str, Any]:
-    """Ведомость материалов по рабочему перечню: трубы — сумма длин участков по типу и диаметру; изделия колодцев — по шаблонам типа объекта; плюс упоминания в DXF."""
-    sid = sec["id"]
-    objs = [dict(r) for r in c.execute("SELECT * FROM wz_items WHERE section_id=? AND layer='object' AND state<>'rejected' AND scope=''", (sid,))]
+def _wz2_rings(depth_m: float, top_m: float, tol_m: float = 0.05, tray_m: float = 0.0) -> dict[str, int]:
+    """Стеновые кольца по глубине: высота стенки = глубина − верх + лоток; набор кратно 0,3 м с допуском, кольцами .9 и одним .6/.3."""
+    h = depth_m - top_m + tray_m
+    u = max(1, math.ceil((h - tol_m) / 0.3 - 1e-9))
+    n9, r = divmod(u, 3)
+    return {k: v for k, v in (("9", n9), ("6", 1 if r == 2 else 0), ("3", 1 if r == 1 else 0)) if v}
+
+
+def _wz2_well_net(o: dict[str, Any]) -> str:
+    m = re.search(r"([A-Za-zА-Яа-я]+\d+(?:\.\d+)?)-(?!Дк)[\w.]+\s*$", o.get("key") or o.get("name") or "")
+    return m.group(1) if m else ""
+
+
+def _wz2_templates(c: sqlite3.Connection, sid: str) -> list[dict[str, Any]]:
     try:
         tpl = json.loads(_wz2_param(c, sid, "mat_templates"))
     except ValueError:
         tpl = WZ2_MAT_TEMPLATES
+    by_match = {t["match"]: t for t in WZ2_MAT_TEMPLATES}
+    return [{**by_match.get(t.get("match"), {}), **t} for t in tpl]   # сохранённые до v.92 шаблоны получают rings/top_m по умолчанию
+
+
+def _wz2_mat_project(c: sqlite3.Connection, sec: Any) -> dict[str, Any]:
+    """Ведомость материалов по рабочему перечню: трубы — сумма длин участков по типу и диаметру; колодцы — состав из таблицы колодцев проекта,
+    иначе шаблон типа (кольца по глубине); колодцы без типа — по преобладающему типу сети; плюс упоминания в DXF."""
+    sid = sec["id"]
+    objs = [dict(r) for r in c.execute("SELECT * FROM wz_items WHERE section_id=? AND layer='object' AND state<>'rejected' AND scope=''", (sid,))]
+    tpl = _wz2_templates(c, sid)
+    try:
+        cfg = {**WZ2_WELL_CFG, **json.loads(_wz2_param(c, sid, "well_cfg") or "{}")}
+    except ValueError:
+        cfg = dict(WZ2_WELL_CFG)
     mats: dict[str, dict[str, Any]] = {}
     no_type: list[tuple[str, int, float]] = []
     skipped = collections.Counter()
+    rings: dict[str, dict[str, Any]] = {}      # серия → {wells, no_depth: [...], assumed}
 
     def add(key: str, name: str, unit: str, cat: str, qty: float, obj: str, how: str) -> None:
-        m = mats.setdefault(key, {"key": key, "name": name, "unit": unit, "cat": cat, "qty": 0.0, "by": [], "how": how})
+        m = mats.setdefault(key, {"key": key, "name": name, "unit": unit, "cat": cat, "qty": 0.0, "by": [], "how": how, "hows": collections.Counter()})
         m["qty"] += qty
         m["by"].append([obj, round(qty, 3)])
+        m["hows"][how] += 1
 
+    typed: list[tuple[dict[str, Any], dict[str, Any], str]] = []
+    generic: list[dict[str, Any]] = []
     for o in objs:
         txt = f"{o['name']} {o['note']}"
-        if "трубопровод" in (o["kind"] or "").lower() or re.search(r"\bL\s*=\s*\d", txt):
+        kind = (o["kind"] or "").lower()
+        if "трубопровод" in kind or re.search(r"\bL\s*=\s*\d", txt):
             mL = re.search(r"L\s*=\s*(\d+(?:[.,]\d+)?)", txt)
             p = _wz2_pipe(o["note"] or o["name"])
             if not mL or not p:
@@ -6912,15 +6956,53 @@ def _wz2_mat_project(c: sqlite3.Connection, sec: Any) -> dict[str, Any]:
             if k:
                 add(k[0], k[1], k[2], k[3], L, o["key"], "сумма длин участков (L из перечня)")
             continue
-        hit = False
-        for t in tpl:
-            if re.search(t["match"], f"{o['kind']} {o['name']}"):
-                for key, name, unit, q in t["items"]:
-                    add(key, name, unit, key.split("|")[0], float(q), o["key"], f"по типу объекта: {q} {unit} на объект")
-                hit = True
-                break
-        if not hit and "колод" in (o["kind"] or "").lower():
+        if "колод" not in kind or "деталь" in kind:
+            continue
+        if "Состав:" in (o["note"] or ""):     # состав из таблицы колодцев проекта
+            for mk, q in re.findall(r"([A-Za-zА-Яа-я0-9. -]+?)×(\d+)", o["note"].split("Состав:")[-1].split("·")[0]):
+                k = _wz2_mat_key(mk.strip())
+                if k:
+                    add(k[0], k[1], k[2], k[3], float(q), o["key"], "по таблице колодцев проекта")
+            continue
+        t = next((t for t in tpl if re.search(t["match"], f"{o['kind']} {o['name']} {o['note']}")), None)
+        if t:
+            typed.append((o, t, ""))
+        else:
+            generic.append(o)
+    # колодцы без указания типа: тип как у большинства колодцев той же сети (иначе — раздела)
+    by_net: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
+    for o, t, _ in typed:
+        if t.get("rings") and "дожд" not in t.get("label", "").lower():
+            by_net[_wz2_well_net(o)][t["label"]] += 1
+            by_net["*"][t["label"]] += 1
+    lab2t = {t.get("label"): t for t in tpl}
+    for o in generic:
+        net = _wz2_well_net(o)
+        cnt = by_net.get(net) or by_net.get("*")
+        if not cnt:
             skipped["well_no_template"] += 1
+            continue
+        lab, n = cnt.most_common(1)[0]
+        typed.append((o, lab2t[lab], f"тип не указан — принят «{lab}», как у {n} колодцев сети {net or 'раздела'}"))
+    for o, t, assumed in typed:
+        how = f"шаблон «{t.get('label', 'колодец')}»" + (" (тип не указан — принят по преобладающему типу сети)" if assumed else "")
+        for key, name, unit, q in t["items"]:
+            add(key, name, unit, key.split("|")[0], float(q), o["key"], how)
+        ser = t.get("rings")
+        if not ser:
+            continue
+        rs = rings.setdefault(ser, {"wells": 0, "no_depth": [], "assumed": 0})
+        rs["wells"] += 1
+        rs["assumed"] += bool(assumed)
+        md = re.search(r"глубин\w*\s*(\d+(?:[.,]\d+)?)\s*(мм|м)\b", o["note"] or "")
+        if not md:
+            rs["no_depth"].append(o["key"])
+            continue
+        d = _wz2_num(md.group(1)) or 0.0
+        d = d / 1000 if md.group(2) == "мм" else d
+        for h, q in _wz2_rings(d, float(t.get("top_m", 0.34)), float(cfg["tol_m"]), float(cfg["tray_m"])).items():
+            code = f"{ser}.{h}"
+            add(f"жби|{code}", f"Кольцо стеновое {code}", "шт", "жби", float(q), o["key"], f"по глубине {d:g} м (стенка = глубина − {t.get('top_m', 0.34):g} м)")
     for okey, dn, L in no_type:   # тип не указан: относим к единственному типу того же диаметра
         cand = [k for k in mats if k.startswith("труба|") and k.endswith(f"|{dn}")]
         if len(cand) == 1:
@@ -6928,6 +7010,12 @@ def _wz2_mat_project(c: sqlite3.Connection, sec: Any) -> dict[str, Any]:
             mats[cand[0]]["by"].append([okey, round(L, 3), "тип трубы не указан — отнесено по диаметру"])
         else:
             add(f"труба|?|{dn}", f"Труба (тип не указан) Ø{dn}", "м", "труба", L, okey, "тип трубы не указан")
+    for m in mats.values():
+        m["how"] = "; ".join(f"{h}" + (f" ×{n}" if len(m["hows"]) > 1 else "") for h, n in m["hows"].most_common(4))
+        del m["hows"]
+        ser = re.match(r"жби\|(КС\d+)\.", m["key"])
+        if ser and ser.group(1) in rings and rings[ser.group(1)]["no_depth"]:
+            m["partial"] = {"wells": rings[ser.group(1)]["wells"], "no_depth": len(rings[ser.group(1)]["no_depth"])}
     dxf: dict[str, dict[str, Any]] = {}
     for f in _wz2_sec_files(c, sec):
         for t in _wz2_dxf_texts(f["id"]):
@@ -6939,7 +7027,8 @@ def _wz2_mat_project(c: sqlite3.Connection, sec: Any) -> dict[str, Any]:
                 continue
             x = dxf.setdefault(key, {"name": name, "cat": cat, "count": 0, "file": f["id"], "fname": f["name"]})
             x["count"] += 1
-    return {"mats": mats, "dxf": dxf, "skipped": dict(skipped)}
+    rings_info = {k: {"wells": v["wells"], "no_depth": len(v["no_depth"]), "no_depth_keys": v["no_depth"][:60], "assumed": v["assumed"]} for k, v in rings.items()}
+    return {"mats": mats, "dxf": dxf, "skipped": dict(skipped), "rings": rings_info}
 
 
 @app.post("/api/wz2/materials/fill")
@@ -6953,7 +7042,7 @@ def wz2_mat_fill(request: Request, section: Optional[str] = None) -> dict[str, A
         pm = _wz2_mat_project(c, sec)
         res = collections.Counter()
         for n, m in enumerate(sorted(pm["mats"].values(), key=lambda x: x["key"])):
-            data = {"computed_qty": round(m["qty"], 3), "by": m["by"][:400], "how": m["how"], "cat": m["cat"], "dxf_mentions": pm["dxf"].get(m["key"], {}).get("count", 0)}
+            data = {"computed_qty": round(m["qty"], 3), "by": m["by"][:400], "how": m["how"], "cat": m["cat"], "dxf_mentions": pm["dxf"].get(m["key"], {}).get("count", 0), "partial": m.get("partial")}
             res[_wz2_item_upsert(c, sid, "material", m["key"], {"name": m["name"], "unit": m["unit"], "qty": round(m["qty"], 3), "kind": m["cat"], "sort": n,
                                                                 "note": f"{m['how']}; объектов {len(m['by'])}", "data_json": json.dumps(data, ensure_ascii=False)}, who)] += 1
         for key, x in pm["dxf"].items():
@@ -6962,12 +7051,18 @@ def wz2_mat_fill(request: Request, section: Optional[str] = None) -> dict[str, A
             res["dxf_" + _wz2_item_upsert(c, sid, "material", key, {"name": x["name"], "unit": "", "qty": None, "kind": x["cat"], "sort": 500, "source_file_id": x["file"],
                                                                  "note": f"упоминается в DXF ({x['fname']}) ×{x['count']}; количество в перечне не определено",
                                                                  "data_json": json.dumps({"dxf_mentions": x["count"], "cat": x["cat"]}, ensure_ascii=False)}, who)] += 1
+        for it in c.execute("SELECT id,key,data_json FROM wz_items WHERE section_id=? AND layer='material' AND key LIKE 'жби|КС%' AND origin<>'manual'", (sid,)).fetchall():
+            if it["key"] not in pm["mats"] and json.loads(it["data_json"] or "{}").get("computed_qty") is not None:   # кольцо больше не получается по глубинам — количество 0
+                _wz2_item_upsert(c, sid, "material", it["key"], {"qty": 0.0, "note": "по глубинам колодцев не требуется", "data_json": json.dumps({**json.loads(it["data_json"] or "{}"), "computed_qty": 0.0}, ensure_ascii=False)}, who)
+        c.execute("INSERT OR REPLACE INTO wz_params (section_id,key,value) VALUES (?,?,?)", (sid, "rings_info", json.dumps(pm["rings"], ensure_ascii=False)))
         _wz2_sub_touch(c, sid, "1.3", "ведомость материалов заполнена")
         sk = pm["skipped"]
         audit(request, c, "wizard2", sid, "materials_fill", f"Мастер 2.0, 1.3: материалы — {dict(res)}; пропущено {sk}"[:300], section_id=sid)
         return {"result": dict(res), "skipped": sk, "message": f"Материалы: из перечня {len(pm['mats'])} позиций, упоминаний в DXF {len(pm['dxf'])}"
                 + (f"; участков без длины или диаметра: {sk.get('pipe_no_data', 0)}" if sk.get("pipe_no_data") else "")
-                + (f"; колодцев без шаблона материалов: {sk.get('well_no_template', 0)}" if sk.get("well_no_template") else "")}
+                + (f"; колодцев без шаблона материалов: {sk.get('well_no_template', 0)}" if sk.get("well_no_template") else "")
+                + "".join(f"; {ser}: глубина не указана у {v['no_depth']} из {v['wells']} колодцев — кольца по ним не посчитаны" for ser, v in pm["rings"].items() if v["no_depth"])
+                + "".join(f"; колодцев без типа, принятых по сети ({ser}): {v['assumed']}" for ser, v in pm["rings"].items() if v["assumed"]), "rings": pm["rings"]}
 
 
 # ---------------------------------------------------------------- трудоёмкость (чел.-ч): своя норма или ГЭСН
@@ -7116,12 +7211,65 @@ def _wz2_est_rows(c: sqlite3.Connection, sid: str) -> list[dict[str, Any]]:
                                           WHERE e.section_id=? AND v.is_current=1 ORDER BY e.title, r.rowid""", (sid,))]
 
 
+def _wz2_gesn_pipe_loss(c: sqlite3.Connection, code: str) -> Optional[tuple[float, str]]:
+    """Потери труб, заложенные в норму ГЭСН: количество труб (ресурс «Трубы…», м) на единицу нормы."""
+    code = re.sub(r"^ГЭСН(?=\d)", "", (code or "").strip())
+    r = c.execute("SELECT code,unit,res_json FROM norm_records WHERE base='ГЭСН' AND code=?", (code,)).fetchone() if code else None
+    if not r:
+        return None
+    mult, base = _wz2_unit(r["unit"])
+    if base == "км":
+        mult, base = mult * 1000, "м"
+    if base != "м":
+        return None
+    for x in json.loads(r["res_json"] or "[]"):
+        q = _wz2_num(x.get("qty"))
+        if str(x.get("name", "")).lower().startswith("труб") and _wz2_unit(x.get("unit", ""))[1] == "м" and q:
+            pct = round((q / mult - 1) * 100, 2)
+            if 0 <= pct <= 15:
+                return pct, f"ГЭСН {r['code']}: трубы {_fmt(q)} м на {r['unit']} — потери {_fmt(pct)} %"
+    return None
+
+
+def _wz2_loss_default(c: sqlite3.Connection, key: str, cat: str, work_codes: list[str]) -> tuple[float, str]:
+    if cat == "труба":
+        for wc in work_codes:
+            g = _wz2_gesn_pipe_loss(c, wc)
+            if g:
+                return g
+        typ = key.split("|")[1] if key.count("|") >= 2 else "?"
+        if typ in WZ2_PIPE_LOSS:
+            v, lab = WZ2_PIPE_LOSS[typ]
+            return v, f"{WZ2_RDS}: {lab} — {_fmt(v)} %" + (" (в смете нет нормы ГЭСН с количеством труб)" if work_codes else "")
+        return 0.0, "тип трубы не указан — норматив потерь не определён, укажите вручную"
+    if cat in ("жби", "люк", "решетка"):
+        return 0.0, WZ2_PIECE_LOSS_SRC
+    return 0.0, "норматив потерь не определён — укажите вручную"
+
+
+def _wz2_loss_over(c: sqlite3.Connection, sid: str) -> dict[str, dict[str, Any]]:
+    try:
+        raw = json.loads(_wz2_param(c, sid, "losses") or "{}")
+    except ValueError:
+        raw = {}
+    return {k: (v if isinstance(v, dict) else {"pct": float(v), "src": "задано ПТО"}) for k, v in raw.items() if v is not None}
+
+
+def _wz2_loss(c: sqlite3.Connection, over: dict[str, dict[str, Any]], key: str, cat: str, work_codes: list[str]) -> dict[str, Any]:
+    pct, src = _wz2_loss_default(c, key, cat, work_codes)
+    o = over.get(key) or over.get(cat)
+    if o:
+        return {"pct": float(o["pct"]), "src": o.get("src") or "задано ПТО", "edited": True, "default_pct": pct, "default_src": src, "by": o.get("by", ""), "at": o.get("at", "")}
+    return {"pct": pct, "src": src, "edited": False, "default_pct": pct, "default_src": src}
+
+
 def _wz2_compare(c: sqlite3.Connection, sid: str) -> dict[str, Any]:
     thr = _wz2_num(_wz2_param(c, sid, "threshold_pct")) or 3.0
+    over = _wz2_loss_over(c, sid)
     try:
-        losses = json.loads(_wz2_param(c, sid, "losses"))
+        rings_info = json.loads(_wz2_param(c, sid, "rings_info") or "{}")
     except ValueError:
-        losses = {}
+        rings_info = {}
     proj = {r["key"]: dict(r) for r in c.execute("SELECT * FROM wz_items WHERE section_id=? AND layer='material' AND state<>'rejected' AND scope=''", (sid,))}
     est: dict[str, dict[str, Any]] = {}
     unrec: list[dict[str, Any]] = []
@@ -7151,7 +7299,8 @@ def _wz2_compare(c: sqlite3.Connection, sid: str) -> dict[str, Any]:
         if p and p["qty"] is None and not e:
             continue   # упоминание в DXF без количества — не сверяем
         cat = (e or {}).get("cat") or (p and json.loads(p["data_json"] or "{}").get("cat")) or "прочее"
-        loss = float(losses.get(cat, losses.get("прочее", 0)) or 0)
+        lo = _wz2_loss(c, over, key, cat, [w["work_code"] for w in (e or {}).get("rows", []) if w["work_code"]])
+        loss = lo["pct"]
         pq = p["qty"] if p and p["qty"] is not None else None
         need = round(pq * (1 + loss / 100), 3) if pq is not None else None
         eq = round(e["qty"], 3) if e else None
@@ -7167,12 +7316,20 @@ def _wz2_compare(c: sqlite3.Connection, sid: str) -> dict[str, Any]:
             st = "ok"
         else:
             st = "over" if diff > 0 else "under"
-        out.append({"key": key, "name": (p or e)["name"], "unit": (p or e)["unit"], "cat": cat, "project": pq, "loss_pct": loss, "need": need, "estimate": eq, "diff": diff, "pct": pct,
+        partial = None
+        mser = re.match(r"жби\|(КС\d+)\.", key)
+        if mser and (rings_info.get(mser.group(1)) or {}).get("no_depth"):
+            partial = rings_info[mser.group(1)]
+            if st in ("over", "estimate_only"):
+                st = "partial"
+        out.append({"key": key, "name": (p or e)["name"], "unit": (p or e)["unit"], "cat": cat, "project": pq, "loss_pct": loss, "loss_src": lo["src"], "loss_edited": lo["edited"],
+                    "need": need, "estimate": eq, "diff": diff, "pct": pct, "partial": partial,
                     "status": st, "rows": (e or {}).get("rows", []), "item_id": p["id"] if p else ""})
-    return {"rows": out, "unrecognized": unrec, "threshold_pct": thr, "losses": losses}
+    return {"rows": out, "unrecognized": unrec, "threshold_pct": thr, "losses": {x["key"]: x["loss_pct"] for x in out}}
 
 
-WZ2_CMP_ST = {"ok": "в пределах порога", "over": "в смете больше", "under": "в смете меньше", "project_only": "нет в смете", "estimate_only": "нет в проекте", "unit": "разные единицы"}
+WZ2_CMP_ST = {"ok": "в пределах порога", "over": "в смете больше", "under": "в смете меньше", "project_only": "нет в смете", "estimate_only": "нет в проекте", "unit": "разные единицы",
+              "partial": "проект неполный"}
 
 
 def _wz2_remark_no(c: sqlite3.Connection, sid: str) -> int:
@@ -7208,17 +7365,24 @@ def wz2_mat_compare(request: Request, section: Optional[str] = None, dry_run: bo
                 elif x["status"] == "unit":
                     text = f"{x['name']}: единицы сметы не совпадают с единицами проекта — сверить вручную."
                     impact = ""
+                elif x["status"] == "partial":
+                    pr = x["partial"]
+                    text = (f"{x['name']}: в смете {_fmt(x['estimate'])} {x['unit']}, по проекту посчитано {_fmt(x['project'] or 0)} {x['unit']} — только по колодцам с глубиной; "
+                            f"у {pr['no_depth']} из {pr['wells']} колодцев глубина в проекте не указана, кольца по ним не посчитаны. Нужна глубина (профиль, таблица колодцев).")
+                    impact = f"не определено: нет глубины у {pr['no_depth']} колодцев"
                 else:
-                    text = (f"{x['name']}: по проекту {_fmt(x['project'])} {x['unit']}" + (f" + потери {x['loss_pct']:g} % = {_fmt(x['need'])}" if x["loss_pct"] else "")
+                    text = (f"{x['name']}: по проекту {_fmt(x['project'])} {x['unit']}" + (f" + потери {_fmt(x['loss_pct'])} % ({x['loss_src']}) = {_fmt(x['need'])}" if x["loss_pct"] else "")
                             + f", в смете {_fmt(x['estimate'])} {x['unit']} — {WZ2_CMP_ST[x['status']]} на {_fmt(abs(x['diff']))} {x['unit']} ({x['pct']:+g} %, порог {r['threshold_pct']:g} %).")
                     impact = f"{x['diff']:+.3f}".replace(".", ",") + f" {x['unit']}"
+                if x["partial"] and x["status"] != "partial":
+                    text += f" Кольца посчитаны не по всем колодцам: у {x['partial']['no_depth']} из {x['partial']['wells']} нет глубины."
                 wcode = next((w["work_code"] for w in x["rows"] if w["work_code"]), "")
-                dq = x["diff"] if x["diff"] is not None else (x["need"] if x["status"] == "project_only" else None)
+                dq = None if x["status"] == "partial" else x["diff"] if x["diff"] is not None else (x["need"] if x["status"] == "project_only" else None)
                 hrs, basis = _wz2_labor_calc(c, wcode, abs(dq) if dq is not None else None, x["unit"]) if wcode else (None, "")
                 links = [{"type": "material", "key": x["key"], "item_id": x["item_id"]}] + [{"type": "estimate_row", "row_uid": w["row_uid"], "n": w["n"], "estimate": w["estimate"]} for w in x["rows"]]
                 old = c.execute("SELECT * FROM wz_remarks WHERE section_id=? AND key=?", (sid, key)).fetchone()
-                fields = {"type": "estimate", "text": text, "impact_mat": impact, "links_json": json.dumps(links, ensure_ascii=False), "source": "сверка материалов (вариант А)",
-                          "data_json": json.dumps({k: x[k] for k in ("project", "need", "estimate", "diff", "pct", "status", "loss_pct")}, ensure_ascii=False)}
+                fields = {"type": "missing" if x["status"] == "partial" else "estimate", "text": text, "impact_mat": impact, "links_json": json.dumps(links, ensure_ascii=False), "source": "сверка материалов (вариант А)",
+                          "data_json": json.dumps({k: x[k] for k in ("project", "need", "estimate", "diff", "pct", "status", "loss_pct", "loss_src", "partial")}, ensure_ascii=False)}
                 if not old or old["labor_code"] == "":
                     fields.update(labor_hours=hrs, labor_basis=basis, labor_code="")
                 if old:
@@ -7230,7 +7394,7 @@ def wz2_mat_compare(request: Request, section: Optional[str] = None, dry_run: bo
                         res["updated"] += 1
                     continue
                 c.execute("INSERT INTO wz_remarks (id,section_id,no,key,type,text,source,links_json,impact_mat,labor_hours,labor_basis,status,origin,data_json,created_by,created_at,updated_by,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                          (str(uuid.uuid4()), sid, _wz2_remark_no(c, sid), key, "estimate", text, fields["source"], fields["links_json"], impact, hrs, basis, "open", "auto", fields["data_json"], who, now(), who, now()))
+                          (str(uuid.uuid4()), sid, _wz2_remark_no(c, sid), key, fields["type"], text, fields["source"], fields["links_json"], impact, hrs, basis, "open", "auto", fields["data_json"], who, now(), who, now()))
                 res["added"] += 1
             for old in c.execute("SELECT * FROM wz_remarks WHERE section_id=? AND origin='auto' AND key LIKE 'mat|%' AND status IN ('open','clarify')", (sid,)).fetchall():
                 if old["key"] not in live:
@@ -7245,25 +7409,65 @@ def wz2_mat_compare(request: Request, section: Optional[str] = None, dry_run: bo
 
 class Wz2Params(BaseModel):
     threshold_pct: Optional[float] = Field(default=None, ge=0, le=100)
-    losses: Optional[dict[str, float]] = None
+    losses: Optional[dict[str, Optional[float]]] = None      # ключ материала или вид → %, None — вернуть норматив
+    loss_src: Optional[dict[str, str]] = None                 # ключ → основание исправленного значения
+    well_cfg: Optional[dict[str, float]] = None
+    mat_templates: Optional[list[dict[str, Any]]] = None
+
+
+def _wz2_loss_rows(c: sqlite3.Connection, sid: str) -> list[dict[str, Any]]:
+    over = _wz2_loss_over(c, sid)
+    cmp_ = _wz2_compare(c, sid)
+    out = []
+    for x in cmp_["rows"]:
+        lo = _wz2_loss(c, over, x["key"], x["cat"], [w["work_code"] for w in x["rows"] if w["work_code"]])
+        out.append({"key": x["key"], "name": x["name"], "cat": x["cat"], **lo})
+    return out
 
 
 @app.get("/api/wz2/params")
 def wz2_params_get(section: Optional[str] = None) -> dict[str, Any]:
     with db() as c:
         sid = _section(c, section)["id"]
-        return {"threshold_pct": _wz2_num(_wz2_param(c, sid, "threshold_pct")), "losses": json.loads(_wz2_param(c, sid, "losses") or "{}"), "mat_templates": json.loads(_wz2_param(c, sid, "mat_templates") or "[]")}
+        return {"threshold_pct": _wz2_num(_wz2_param(c, sid, "threshold_pct")), "losses": _wz2_loss_rows(c, sid),
+                "well_cfg": {**WZ2_WELL_CFG, **json.loads(_wz2_param(c, sid, "well_cfg") or "{}")}, "mat_templates": _wz2_templates(c, sid),
+                "rings_info": json.loads(_wz2_param(c, sid, "rings_info") or "{}"), "rds_pipe": {k: v[0] for k, v in WZ2_PIPE_LOSS.items()}}
 
 
 @app.put("/api/wz2/params")
 def wz2_params_put(request: Request, p: Wz2Params, section: Optional[str] = None) -> dict[str, Any]:
+    who = _who(request)
     with db() as c:
         sid = _section(c, section)["id"]
         if p.threshold_pct is not None:
             c.execute("INSERT OR REPLACE INTO wz_params (section_id,key,value) VALUES (?,?,?)", (sid, "threshold_pct", str(p.threshold_pct)))
         if p.losses is not None:
-            c.execute("INSERT OR REPLACE INTO wz_params (section_id,key,value) VALUES (?,?,?)", (sid, "losses", json.dumps({k[:30]: max(0.0, min(float(v), 100.0)) for k, v in p.losses.items()}, ensure_ascii=False)))
-        audit(request, c, "wizard2", sid, "params", f"Мастер 2.0: параметры сверки — порог {p.threshold_pct}, потери {p.losses}"[:300], section_id=sid)
+            over = _wz2_loss_over(c, sid)
+            for k, v in p.losses.items():
+                k = k[:80]
+                if v is None:
+                    over.pop(k, None)
+                    continue
+                if not 0 <= float(v) <= 100:
+                    raise HTTPException(422, f"Потери {k}: от 0 до 100 %")
+                src = ((p.loss_src or {}).get(k) or "").strip()[:300] or (over.get(k, {}).get("src") if over.get(k, {}).get("pct") == float(v) else "") or "задано ПТО"
+                over[k] = {"pct": float(v), "src": src, "by": who, "at": now()}
+            c.execute("INSERT OR REPLACE INTO wz_params (section_id,key,value) VALUES (?,?,?)", (sid, "losses", json.dumps(over, ensure_ascii=False)))
+        if p.well_cfg is not None:
+            cfg = {k: float(p.well_cfg[k]) for k in WZ2_WELL_CFG if k in p.well_cfg}
+            if any(not 0 <= v <= 1 for v in cfg.values()):
+                raise HTTPException(422, "Параметры колодцев: от 0 до 1 м")
+            c.execute("INSERT OR REPLACE INTO wz_params (section_id,key,value) VALUES (?,?,?)", (sid, "well_cfg", json.dumps(cfg)))
+        if p.mat_templates is not None:
+            for t in p.mat_templates:
+                try:
+                    re.compile(str(t.get("match", "")))
+                except re.error as e:
+                    raise HTTPException(422, f"Шаблон «{t.get('label', '')}»: ошибка в условии — {e}")
+                if not t.get("match") or not isinstance(t.get("items"), list) or any(not isinstance(i, list) or len(i) != 4 for i in t["items"]):
+                    raise HTTPException(422, f"Шаблон «{t.get('label', '')}»: нужны match и items [[ключ, наименование, ед., кол-во], …]")
+            c.execute("INSERT OR REPLACE INTO wz_params (section_id,key,value) VALUES (?,?,?)", (sid, "mat_templates", json.dumps(p.mat_templates, ensure_ascii=False)))
+        audit(request, c, "wizard2", sid, "params", f"Мастер 2.0: параметры сверки — порог {p.threshold_pct}, потери {p.losses}, колодцы {p.well_cfg}, шаблоны {'изменены' if p.mat_templates is not None else '—'}"[:300], section_id=sid)
         return {"message": "Параметры сохранены"}
 
 
@@ -7355,6 +7559,29 @@ def wz2_remark_edit(request: Request, rid: str, p: RemarkIn) -> dict[str, Any]:
             c.execute("UPDATE wz_remarks SET " + ",".join(f"{k}=?" for k in diff) + ", updated_by=?, updated_at=? WHERE id=?", (*diff.values(), who, now(), rid))
             audit(request, c, "wz_remark", rid, "edit", f"Замечание З-{r['no']:03d}: " + ", ".join(diff)[:200], {k: [r[k], v] for k, v in diff.items()}, section_id=r["section_id"])
         return {"message": "Сохранено" if diff else "Без изменений", "remark": _wz2_remark_row(c.execute("SELECT * FROM wz_remarks WHERE id=?", (rid,)).fetchone())}
+
+
+def _wz2_remarks_table(c: sqlite3.Connection, sec: Any) -> list[list[Any]]:
+    rows = [_wz2_remark_row(r) for r in c.execute("SELECT * FROM wz_remarks WHERE section_id=? ORDER BY no", (sec["id"],))]
+    out: list[list[Any]] = [[f"Справка по замечаниям к проекту — {sec['code']} ({now()[:10]}), для собственных нужд"],
+                            ["№", "Тип", "Описание", "Цитата", "Источник", "Влияние на объём", "Влияние на материалы", "Трудоёмкость, чел.-ч", "Основание трудоёмкости", "Статус", "Решение", "Связанные пункты"]]
+    for r in rows:
+        out.append([r["code"], r["type_label"], r["text"], r["quote"], r["source"], r["impact_qty"], r["impact_mat"], "" if r["labor_hours"] is None else str(r["labor_hours"]).replace(".", ","),
+                    r["labor_basis"], r["status_label"], r["decision"], "; ".join(str(l.get("key") or ("смета п." + str(l.get("n", "")))) for l in r["links"])])
+    out.append([])
+    out.append(["Итого замечаний", len(rows), "открыто", sum(1 for r in rows if r["status"] in ("open", "clarify")), "", "", "Σ чел.-ч (кроме снятых)",
+                str(round(sum(r["labor_hours"] or 0 for r in rows if r["status"] != "dropped"), 2)).replace(".", ",")])
+    return out
+
+
+@app.get("/api/wz2/remarks/export.tsv")
+def wz2_remarks_tsv(section: Optional[str] = None) -> Response:
+    """Справка по замечаниям — текст с табуляцией: вставляется в Google Таблицу (Ctrl+V) по ячейкам."""
+    with db() as c:
+        sec = _section(c, section)
+        tab = _wz2_remarks_table(c, sec)
+    clean = lambda v: re.sub(r"[\t\r\n]+", " ", str(v))  # noqa: E731
+    return Response("\n".join("\t".join(clean(v) for v in row) for row in tab), media_type="text/plain; charset=utf-8")
 
 
 @app.get("/api/wz2/remarks/export.csv")
@@ -13994,7 +14221,7 @@ HTML = r'''<!doctype html>
 <section id="page-list" class="hidden"><div class="dtabs"><button id="swFiles2" onclick="showPage('files')">Файлы проекта</button><button id="swList2" class="on" onclick="showPage('list')">Перечень работ · каркас ИД</button><button id="swMatch" onclick="showPage('match')">Сопоставление со сметой</button></div><div class="heading"><div><h1>Перечень работ</h1><div class="sub">Что отмечает прораб: колодцы, участки, операции — для выбранного раздела</div></div><div style="display:flex;gap:8px;align-items:center"><button class="btn" onclick="openZones()" id="zBtn">Состав раздела…</button><div class="tag" id="listTag">—</div></div></div><div class="panel" id="wizBox" style="margin-bottom:16px"><div class="wizsteps" id="wizSteps"><div class="loading">Загружаем шаги…</div></div><div id="wizBody" style="margin-top:14px"></div><button class="btn hidden" id="elAddBtn" onclick="elFormToggle()">Добавить элемент вручную</button><div id="elFormBox" class="hidden" style="margin-top:14px;max-width:560px"><h3 style="margin:0 0 8px;font-size:15px">Добавить элемент вручную</h3><form id="elementForm"><div class="field"><label>Шифр на плане</label><input name="code" placeholder="К-03" required></div><div class="field"><label>Название объекта / участка</label><input name="name" placeholder="Колодец К-03" required></div><div class="field"><label>Вид элемента</label><select name="kind"><option>Колодец</option><option>Трубопровод</option><option>Узел</option><option>Камера</option><option>Выпуск</option><option>Другое</option></select></div><div class="field"><label id="elBlkLbl">Часть раздела</label><input name="block" value="Часть 1" list="blkList"></div><div class="field"><label>Примечание по проекту</label><textarea name="planned_note" placeholder="Ссылка на лист, оси, пикетаж"></textarea></div><button class="btn primary" type="submit">Добавить в перечень</button></form></div></div><div class="panel hidden" id="wizLeft" style="margin-bottom:16px"><div class="sectionhead"><h2>Остатки для ручного сопоставления</h2></div><div class="dtabs" id="ltTabs" style="margin-top:8px"></div><div class="sub" id="ltNote" style="margin:8px 0"></div><div class="tablewrap" style="max-height:60vh;overflow:auto"><table class="table" style="min-width:760px"><thead id="ltHead"></thead><tbody id="ltBody"><tr><td class="loading">Загружаем…</td></tr></tbody></table></div></div><div class="cards2"><div class="panel"><div class="sectionhead"><h2>Загрузка готового перечня</h2></div><div id="seedBox" class="sub">Загружаем список наборов…</div></div></div></section></div></main></div><div id="modal" class="hidden"></div><div id="toast" class="toast hidden"></div>
 <script>
 let elements=[], overviewData={}, projects=[], roles=[], cur={project:null,section:null};
-const SCOPED=['/api/wz2','/api/wz2/norms/fill','/api/wz2/materials/fill','/api/wz2/materials/compare','/api/wz2/params','/api/wz2/remarks','/api/wz2/remarks/export.csv','/api/wz2/notices','/api/wz2/items','/api/wz2/items/bulk','/api/wz2/groups','/api/wz2/confirm','/api/wz2/rollback','/api/wz2/history','/api/wizard','/api/wizard/analyze','/api/wizard/step','/api/wizard/match','/api/wizard/list','/api/overview','/api/elements','/api/history','/api/ozhr','/api/ozhr/extra','/api/ozhr/meta','/api/ozhr/rows','/api/ozhr/staff','/api/ozhr/reassign','/api/weather','/api/weather/fill','/api/weather/coords','/api/acts','/api/acts/proposals','/api/gantt','/api/vhk','/api/vhk-expected','/api/vhk-expected/link','/api/vhk-docs','/api/vhk-docs/one','/api/vhk-docs/file','/api/vhk-docs/rows','/api/vhk-docs/links','/api/vhk-docs/class','/api/work-analysis','/api/work-analysis/facts','/api/work-analysis/fact','/api/kits','/api/estimate-relations','/api/estimate-lines/review','/api/complex-rules','/api/double-count','/api/row-card','/api/facts','/api/facts/queue','/api/ledger','/api/estimates','/api/estimate-rows','/api/works','/api/coverage','/api/norm-refs','/api/norm-reqs','/api/norm-refs/scan','/api/alloc','/api/alloc/auto','/api/alloc/confirm','/api/lab','/api/lab/rules','/api/lab/seed','/api/lab/protocols','/api/lab/file','/api/audit','/api/schemes','/api/zones','/api/zones/term','/api/zones/rename','/api/zones/delete','/api/zones/move','/api/doc-status','/api/suggest-list','/api/elements/bulk','/api/documents','/api/revisions','/api/schema-versions'];
+const SCOPED=['/api/wz2','/api/wz2/norms/fill','/api/wz2/materials/fill','/api/wz2/materials/compare','/api/wz2/params','/api/wz2/remarks','/api/wz2/remarks/export.csv','/api/wz2/remarks/export.tsv','/api/wz2/notices','/api/wz2/items','/api/wz2/items/bulk','/api/wz2/groups','/api/wz2/confirm','/api/wz2/rollback','/api/wz2/history','/api/wizard','/api/wizard/analyze','/api/wizard/step','/api/wizard/match','/api/wizard/list','/api/overview','/api/elements','/api/history','/api/ozhr','/api/ozhr/extra','/api/ozhr/meta','/api/ozhr/rows','/api/ozhr/staff','/api/ozhr/reassign','/api/weather','/api/weather/fill','/api/weather/coords','/api/acts','/api/acts/proposals','/api/gantt','/api/vhk','/api/vhk-expected','/api/vhk-expected/link','/api/vhk-docs','/api/vhk-docs/one','/api/vhk-docs/file','/api/vhk-docs/rows','/api/vhk-docs/links','/api/vhk-docs/class','/api/work-analysis','/api/work-analysis/facts','/api/work-analysis/fact','/api/kits','/api/estimate-relations','/api/estimate-lines/review','/api/complex-rules','/api/double-count','/api/row-card','/api/facts','/api/facts/queue','/api/ledger','/api/estimates','/api/estimate-rows','/api/works','/api/coverage','/api/norm-refs','/api/norm-reqs','/api/norm-refs/scan','/api/alloc','/api/alloc/auto','/api/alloc/confirm','/api/lab','/api/lab/rules','/api/lab/seed','/api/lab/protocols','/api/lab/file','/api/audit','/api/schemes','/api/zones','/api/zones/term','/api/zones/rename','/api/zones/delete','/api/zones/move','/api/doc-status','/api/suggest-list','/api/elements/bulk','/api/documents','/api/revisions','/api/schema-versions'];
 const SCOPED_PFX=['/api/wz2/notices/','/api/works/','/api/kits/','/api/complex-rules/','/api/estimate-lines/'];
 function scoped(path){return cur.section&&(SCOPED.some(p=>path===p||path.startsWith(p+'?'))||SCOPED_PFX.some(p=>path.startsWith(p))||path.startsWith('/api/schemes/'))?path+(path.includes('?')?'&':'?')+'section='+encodeURIComponent(cur.section):path}
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -14456,8 +14683,8 @@ function wz2SubRender(){const box=document.getElementById('wz2SubBody');if(!box)
  const foot=`<div class="wact"><button class="btn small" onclick="wz2Confirm('${x.id}')">Подшаг выполнен</button>${x.phase!=='Ф0'?`<button class="btn small" onclick="wz2Confirm('${x.id}','skip')">Пропустить</button>`:''}</div>`;
  if(WZ2sub==='1.0'){const o=WZ&&WZ.steps[0]||{},c=o.counters||{},f=o.found||{};box.innerHTML=`<p class="sub" style="margin:0">Файлы раздела: основные — DXF чертежей и XML сметы. PDF и OCR — позже.</p><div class="wkv"><span><b>${c.project_files||0}</b>файлов проекта</span><span><b>${c.estimate_files||0}</b>смет</span>${f.at?`<span>найдено новых объектов: <b>${f.new_project}</b></span><span>чужие сети: ${esc(Object.entries(f.other_nets||{}).map(([k,v])=>k+' — '+v).join(', ')||'нет')}</span>`:''}</div><div class="wact"><button class="btn" onclick="wizAnalyze()">Проанализировать файлы</button><button class="btn" onclick="showPage('files')">Файлы проекта →</button></div>`+foot;return}
  if(WZ2sub==='1.1'){box.innerHTML=`<p class="sub" style="margin:0">Нормативы раздела: библиотека по умолчанию (редактируется) и ссылки, найденные в надписях чертежей DXF. Принятые нормативы пойдут в АОСР и в проверки замечаний.</p><div class="wact" style="margin:8px 0"><button class="btn primary" onclick="wz2Fill('norms')">Заполнить: библиотека + DXF</button><button class="btn" onclick="wz2NormLib()">Библиотека нормативов…</button><button class="btn" onclick="wz2Journal(1,'layer:norm')">Откатить нормативы…</button></div>`+wz2TableShell()+foot;WZ2f.layer='norm';wz2Items();return}
- if(WZ2sub==='1.3'){box.innerHTML=`<p class="sub" style="margin:0">Ведомость материалов проекта: трубы — по длинам участков перечня (тип и диаметр из описания), изделия колодцев — по типу колодца, плюс упоминания в DXF. Количество можно поправить — ручная правка не перезаписывается при повторном заполнении.</p><div class="wact" style="margin:8px 0"><button class="btn primary" onclick="wz2Fill('materials')">Заполнить ведомость</button><button class="btn" onclick="WZ2sub='1.4';wizRender()">Сверить со сметой →</button><button class="btn" onclick="wz2Journal(1,'layer:material')">Откатить материалы…</button></div>`+wz2TableShell()+foot;WZ2f.layer='material';wz2Items();return}
- if(WZ2sub==='1.4'){box.innerHTML=`<p class="sub" style="margin:0">Замечания к проекту — справка для собственных нужд (не письмо). Сверка материалов проект–смета (вариант А): по ведомости 1.3, в единицах проекта, с учётом потерь; расхождение больше порога становится замечанием. Трудоёмкость — в чел.-ч по ГЭСН или по своей норме.</p><div class="wact" style="margin:8px 0"><button class="btn primary" onclick="wz2Compare(false)">Сверить материалы со сметой</button><button class="btn" onclick="wz2Params()">Порог и потери…</button><button class="btn" onclick="wz2RemarkEdit()">+ замечание</button><button class="btn" onclick="wz2Labor()">Нормы трудоёмкости…</button><a class="btn" href="${scoped('/api/wz2/remarks/export.csv')}" target="_blank">Справка (CSV для Google Таблиц)</a></div><div id="wz2Cmp"></div><h3 style="margin:14px 0 6px">Замечания</h3><div id="wz2Rem" class="loading">Загружаем…</div>`+foot;wz2Compare(true);wz2Remarks();return}
+ if(WZ2sub==='1.3'){box.innerHTML=`<p class="sub" style="margin:0">Ведомость материалов проекта: трубы — по длинам участков перечня (тип и диаметр из описания), изделия колодцев — из таблицы колодцев проекта, иначе по шаблону типа (кольца — по глубине; колодцы без типа — по преобладающему типу сети), плюс упоминания в DXF. Количество можно поправить — ручная правка не перезаписывается при повторном заполнении.</p><div class="wact" style="margin:8px 0"><button class="btn primary" onclick="wz2Fill('materials')">Заполнить ведомость</button><button class="btn" onclick="WZ2sub='1.4';wizRender()">Сверить со сметой →</button><button class="btn" onclick="wz2Journal(1,'layer:material')">Откатить материалы…</button></div>`+wz2TableShell()+foot;WZ2f.layer='material';wz2Items();return}
+ if(WZ2sub==='1.4'){box.innerHTML=`<p class="sub" style="margin:0">Замечания к проекту — справка для собственных нужд (не письмо). Сверка материалов проект–смета (вариант А): по ведомости 1.3, в единицах проекта, с учётом потерь; расхождение больше порога становится замечанием. Трудоёмкость — в чел.-ч по ГЭСН или по своей норме.</p><div class="wact" style="margin:8px 0"><button class="btn primary" onclick="wz2Compare(false)">Сверить материалы со сметой</button><button class="btn" onclick="wz2Params()">Порог и потери…</button><button class="btn" onclick="wz2RemarkEdit()">+ замечание</button><button class="btn" onclick="wz2Labor()">Нормы трудоёмкости…</button><button class="btn" onclick="wz2ToGoogle()">Справка → в Google Таблицу</button><a class="btn" href="${scoped('/api/wz2/remarks/export.csv')}" target="_blank">CSV</a></div><div id="wz2Cmp"></div><h3 style="margin:14px 0 6px">Замечания</h3><div id="wz2Rem" class="loading">Загружаем…</div>`+foot;wz2Compare(true);wz2Remarks();return}
  if(WZ2f.layer!=='object'&&WZ2f.layer!=='work')WZ2f.layer='object';box.innerHTML=`<div class="wact" style="margin:0 0 8px"><button class="btn small ${WZ2f.layer==='object'?'primary':''}" onclick="WZ2f.layer='object';wz2Items()">Объекты</button><button class="btn small ${WZ2f.layer==='work'?'primary':''}" onclick="WZ2f.layer='work';wz2Items()">Виды работ</button>
   <select class="wscope" onchange="WZ2f.state=this.value;wz2Items()"><option value="">все состояния</option>${Object.entries(WZ2STATE).map(([k,v])=>`<option value="${k}" ${WZ2f.state===k?'selected':''}>${v}</option>`).join('')}<option value="excluded" ${WZ2f.state==='excluded'?'selected':''}>не делаем / другой подрядчик</option></select>
   <input class="wscope" style="width:200px" placeholder="поиск: шифр, наименование" value="${esc(WZ2f.q)}" onchange="WZ2f.q=this.value;wz2Items()"><button class="btn small" onclick="wz2Add()">+ ${WZ2f.layer==='object'?'объект':'вид работ'}</button></div>
@@ -14467,8 +14694,8 @@ async function wz2Fill(what){try{const r=await api('/api/wz2/'+what+'/fill',{met
 function wz2Num(x){return x==null?'—':(+x).toLocaleString('ru-RU',{maximumFractionDigits:3})}
 let WZ2cmp=null;
 async function wz2Compare(dry){const box=document.getElementById('wz2Cmp');try{const r=await api('/api/wz2/materials/compare?dry_run='+(dry?'true':'false'),{method:'POST'});WZ2cmp=r;if(!dry){toast(r.message);wz2Remarks();wz2Refresh()}
- const cls={ok:'done',over:'work',under:'work',project_only:'locked',estimate_only:'locked',unit:'stale'};
- box.innerHTML=r.rows.length?`<div class="kind" style="margin-bottom:6px">Порог ${r.threshold_pct} %, потери: ${esc(Object.entries(r.losses).map(([k,v])=>k+' '+v+' %').join(', '))}. ${esc(r.message)}${r.unrecognized.length?` · позиций-материалов сметы без сверки (нет количества в проекте): ${r.unrecognized.length}`:''}</div><div class="tablewrap" style="max-height:40vh;overflow:auto"><table class="table" style="min-width:860px"><thead><tr><th>Материал</th><th>Проект</th><th>Потери</th><th>Нужно</th><th>Смета</th><th>Разница</th><th>Итог</th><th>Позиции сметы</th></tr></thead><tbody>${r.rows.map(x=>`<tr><td>${esc(x.name)}</td><td>${wz2Num(x.project)} ${esc(x.unit)}</td><td class="kind">${x.loss_pct?x.loss_pct+' %':''}</td><td>${wz2Num(x.need)}</td><td>${wz2Num(x.estimate)}</td><td>${x.diff==null?'':wz2Num(x.diff)+(x.pct!=null?` <span class="kind">(${x.pct>0?'+':''}${x.pct} %)</span>`:'')}</td><td><span class="wbd ${cls[x.status]||''}">${esc(r.statuses[x.status]||x.status)}</span></td><td class="kind">${x.rows.map(w=>'п.'+esc(w.n)+' '+esc(w.name.slice(0,50))+' — '+wz2Num(w.qty)+' '+esc(w.unit)).join('<br>')}</td></tr>`).join('')}</tbody></table></div>${dry?'<div class="kind">Это предварительный результат. Нажмите «Сверить материалы со сметой» — расхождения станут замечаниями.</div>':''}`:'<div class="hintbox">Нет данных для сверки: заполните ведомость материалов (1.3) и загрузите смету раздела.</div>'}catch(e){box.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}
+ const cls={ok:'done',over:'work',under:'work',project_only:'locked',estimate_only:'locked',unit:'stale',partial:'stale'};
+ box.innerHTML=r.rows.length?`<div class="kind" style="margin-bottom:6px">Порог ${r.threshold_pct} %; потери — по сметным нормативам (наведите на % — основание; исправить — «Порог и потери…»). ${esc(r.message)}${r.unrecognized.length?` · позиций-материалов сметы без сверки (нет количества в проекте): ${r.unrecognized.length}`:''}</div><div class="tablewrap" style="max-height:40vh;overflow:auto"><table class="table" style="min-width:860px"><thead><tr><th>Материал</th><th>Проект</th><th>Потери</th><th>Нужно</th><th>Смета</th><th>Разница</th><th>Итог</th><th>Позиции сметы</th></tr></thead><tbody>${r.rows.map(x=>`<tr><td>${esc(x.name)}</td><td>${wz2Num(x.project)} ${esc(x.unit)}${x.partial?`<div class="kind" style="color:#b45309">нет глубины у ${x.partial.no_depth} из ${x.partial.wells} колодцев</div>`:''}</td><td class="kind" title="${esc(x.loss_src||'')}">${x.loss_pct?String(x.loss_pct).replace('.',',')+' %':'0'}${x.loss_edited?' ✎':''}</td><td>${wz2Num(x.need)}</td><td>${wz2Num(x.estimate)}</td><td>${x.diff==null?'':wz2Num(x.diff)+(x.pct!=null?` <span class="kind">(${x.pct>0?'+':''}${x.pct} %)</span>`:'')}</td><td><span class="wbd ${cls[x.status]||''}">${esc(r.statuses[x.status]||x.status)}</span></td><td class="kind">${x.rows.map(w=>'п.'+esc(w.n)+' '+esc(w.name.slice(0,50))+' — '+wz2Num(w.qty)+' '+esc(w.unit)).join('<br>')}</td></tr>`).join('')}</tbody></table></div>${dry?'<div class="kind">Это предварительный результат. Нажмите «Сверить материалы со сметой» — расхождения станут замечаниями.</div>':''}`:'<div class="hintbox">Нет данных для сверки: заполните ведомость материалов (1.3) и загрузите смету раздела.</div>'}catch(e){box.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}
 let WZ2rem=null;
 async function wz2Remarks(){const box=document.getElementById('wz2Rem');if(!box)return;try{WZ2rem=await api('/api/wz2/remarks');const R=WZ2rem.remarks,t=WZ2rem.totals;
  box.className='';box.innerHTML=`<div class="kind" style="margin-bottom:6px">Всего ${t.count}, открыто ${t.open}, Σ трудоёмкость (кроме снятых) ${wz2Num(t.labor_hours)} чел.-ч</div><div class="tablewrap" style="max-height:50vh;overflow:auto"><table class="table" style="min-width:900px"><thead><tr><th>№</th><th>Тип</th><th>Описание</th><th>Влияние</th><th>Чел.-ч</th><th>Статус</th><th></th></tr></thead><tbody>${R.map(x=>`<tr class="${x.status==='dropped'?'wsx':''}"><td class="code">${esc(x.code)}</td><td class="kind">${esc(x.type_label)}<div>${x.origin==='auto'?'автопроверка':'вручную'}</div></td><td>${esc(x.text)}${x.decision?`<div class="kind">Решение: ${esc(x.decision)}</div>`:''}</td><td class="kind">${esc([x.impact_qty,x.impact_mat].filter(Boolean).join('; '))}</td><td>${x.labor_hours!=null?wz2Num(x.labor_hours):''}<div class="kind">${esc(x.labor_basis||'')}</div></td><td><span class="wbd ${x.status==='open'?'work':x.status==='dropped'?'locked':x.status==='accepted'?'done':'stale'}">${esc(x.status_label)}</span></td><td class="ws"><button class="btn small" onclick="wz2RemarkEdit('${x.id}')">Изменить</button></td></tr>`).join('')||'<tr><td colspan="7" class="empty">Замечаний нет</td></tr>'}</tbody></table></div>`}catch(e){box.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}
@@ -14478,8 +14705,11 @@ function wz2RemarkEdit(id){const x=id?(WZ2rem&&WZ2rem.remarks.find(r=>r.id===id)
 async function wz2RemarkSave(id){const g=k=>document.getElementById(k).value;const b={type:g('rmType'),status:g('rmSt'),text:g('rmText'),quote:g('rmQuote'),source:g('rmSrc'),impact_qty:g('rmIq'),impact_mat:g('rmIm'),decision:g('rmDec')};
  if(g('rmLc').trim()&&g('rmLq')!==''){b.labor_code=g('rmLc').trim();b.labor_qty=+g('rmLq');if(g('rmLu').trim())b.labor_unit=g('rmLu').trim()}
  try{const r=await api('/api/wz2/remarks'+(id?'/'+encodeURIComponent(id):''),{method:id?'PUT':'POST',body:JSON.stringify(b)});closeModal();toast(r.message);wz2Remarks();wz2Refresh()}catch(e){toast(e.message,true)}}
-async function wz2Params(){try{const p=await api('/api/wz2/params');openModal(`<h2>Сверка материалов: порог и потери</h2><div class="field"><label>Порог расхождения, %</label><input id="prThr" type="number" step="any" value="${p.threshold_pct}"></div><p class="sub" style="margin:0 0 6px">Нормативные потери по видам материалов, % (добавляются к количеству по проекту перед сравнением со сметой):</p>${Object.entries(p.losses).map(([k,v])=>`<div class="field"><label>${esc(k)}</label><input class="prLoss" data-k="${esc(k)}" type="number" step="any" value="${v}"></div>`).join('')}<div class="dialogactions"><button class="btn" onclick="closeModal()">Отмена</button><button class="btn primary" onclick="wz2ParamsSave()">Сохранить</button></div>`)}catch(e){toast(e.message,true)}}
-async function wz2ParamsSave(){const losses={};document.querySelectorAll('.prLoss').forEach(i=>losses[i.dataset.k]=+i.value||0);try{const r=await api('/api/wz2/params',{method:'PUT',body:JSON.stringify({threshold_pct:+document.getElementById('prThr').value,losses})});closeModal();toast(r.message);wz2Compare(true)}catch(e){toast(e.message,true)}}
+async function wz2Params(){try{const p=await api('/api/wz2/params');WZ2par=p;const L=p.losses;openModal(`<h2>Сверка материалов: порог, потери, колодцы</h2><div class="field"><label>Порог расхождения, %</label><input id="prThr" type="number" step="any" value="${p.threshold_pct}"></div><h3 style="margin:10px 0 4px">Потери, %</h3><p class="sub" style="margin:0 0 6px">По умолчанию — из сметных нормативов: для труб из нормы ГЭСН работы сметы, иначе РДС 82-202-96 прил. З; для колец, плит, люков и решёток — 0 %. Исправленное значение помечается ✎; «норматив» возвращает значение по умолчанию.</p>${L.length?`<div class="tablewrap" style="max-height:38vh;overflow:auto"><table class="table"><thead><tr><th>Материал и основание</th><th style="width:96px">%</th><th style="width:96px"></th></tr></thead><tbody>${L.map((x,i)=>`<tr><td><b>${esc(x.name)}</b>${x.edited?' ✎':''}<div class="kind">${x.edited?'исправлено: '+esc(x.src)+(x.by?' ('+esc(x.by)+', '+esc(fmtDT(x.at))+')':'')+'<br>норматив: '+String(x.default_pct).replace('.',',')+' % — '+esc(x.default_src):esc(x.default_src)}</div><input class="prSrc" data-i="${i}" value="${esc(x.edited?x.src:'')}" placeholder="основание, если меняете %" style="width:100%;margin-top:4px"></td><td><input class="prLoss" data-i="${i}" type="number" step="any" min="0" max="100" value="${x.pct}" style="width:80px"></td><td>${x.edited?`<button class="btn" onclick="wz2LossReset(${i})">норматив</button>`:''}</td></tr>`).join('')}</tbody></table></div>`:'<div class="hintbox">Нет материалов для сверки: заполните ведомость (1.3).</div>'}<h3 style="margin:12px 0 4px">Колодцы: кольца по глубине</h3><p class="sub" style="margin:0 0 6px">Высота стенки = глубина − «верх» шаблона + лоток; набирается кольцами .9 и одним .6/.3 (кратно 0,3 м) с допуском.</p><div class="field"><label>Допуск набора, м</label><input id="prTol" type="number" step="0.01" value="${p.well_cfg.tol_m}"></div><div class="field"><label>Лоток над днищем, м</label><input id="prTray" type="number" step="0.01" value="${p.well_cfg.tray_m}"></div>${Object.entries(p.rings_info||{}).map(([k,v])=>`<div class="kind">${esc(k)}: колодцев ${v.wells}, без глубины ${v.no_depth}${v.assumed?', тип принят по сети '+v.assumed:''}</div>`).join('')}<details style="margin-top:8px"><summary>Шаблоны изделий колодцев (JSON)</summary><p class="sub">match — условие по типу/названию; items — [ключ, наименование, ед., кол-во на колодец]; rings — серия колец по глубине; top_m — высота верха, м. Колодцы без типа получают преобладающий тип своей сети.</p><textarea id="prTpl" rows="10" style="width:100%;font-family:monospace;font-size:12px">${esc(JSON.stringify(p.mat_templates,null,1))}</textarea></details><div class="dialogactions"><button class="btn" onclick="closeModal()">Отмена</button><button class="btn primary" onclick="wz2ParamsSave()">Сохранить</button></div>`);document.querySelector('#modal .dialog').classList.add('wide')}catch(e){toast(e.message,true)}}
+let WZ2par=null;
+async function wz2LossReset(i){const x=WZ2par.losses[i];try{await api('/api/wz2/params',{method:'PUT',body:JSON.stringify({losses:{[x.key]:null}})});closeModal();toast('Возвращено значение по нормативу');wz2Params();wz2Compare(true)}catch(e){toast(e.message,true)}}
+async function wz2ParamsSave(){const L=WZ2par.losses,losses={},loss_src={};document.querySelectorAll('.prLoss').forEach(inp=>{const x=L[+inp.dataset.i],v=+inp.value||0,src=document.querySelector(`.prSrc[data-i="${inp.dataset.i}"]`).value.trim();if(Math.abs(v-x.pct)>1e-9||(x.edited&&src&&src!==x.src)||(!x.edited&&src)){losses[x.key]=v;if(src)loss_src[x.key]=src}});const body={threshold_pct:+document.getElementById('prThr').value,losses,loss_src,well_cfg:{tol_m:+document.getElementById('prTol').value,tray_m:+document.getElementById('prTray').value}};const tt=document.getElementById('prTpl').value;if(tt.trim()!==JSON.stringify(WZ2par.mat_templates,null,1).trim()){try{body.mat_templates=JSON.parse(tt)}catch(e){toast('Шаблоны: ошибка JSON — '+e.message,true);return}}try{const r=await api('/api/wz2/params',{method:'PUT',body:JSON.stringify(body)});closeModal();toast(r.message+(body.mat_templates||body.well_cfg?' · обновите ведомость материалов (1.3), чтобы пересчитать кольца':''));wz2Compare(true)}catch(e){toast(e.message,true)}}
+async function wz2ToGoogle(){try{const r=await fetch(scoped('/api/wz2/remarks/export.tsv'),{cache:'no-store'});if(!r.ok)throw Error('Справка: '+r.status);const t=await r.text();let ok=false;try{await navigator.clipboard.writeText(t);ok=true}catch(e){}if(ok){window.open('https://sheets.new','_blank');toast('Справка скопирована. В открывшейся Google Таблице нажмите Ctrl+V')}else{openModal(`<h2>Справка → Google Таблица</h2><p class="sub">Буфер обмена недоступен: выделите текст (Ctrl+A, Ctrl+C), откройте <a href="https://sheets.new" target="_blank">новую Google Таблицу</a> и вставьте (Ctrl+V).</p><textarea id="gsT" rows="12" style="width:100%">${esc(t)}</textarea><div class="dialogactions"><button class="btn" onclick="closeModal()">Закрыть</button></div>`);setTimeout(()=>document.getElementById('gsT').select(),50)}}catch(e){toast(e.message,true)}}
 async function wz2NormLib(){try{const d=await api('/api/wz2/normlib');openModal(`<div class="wz2wide"><h2>Библиотека нормативов (по умолчанию для разделов)</h2><div class="tablewrap" style="max-height:50vh;overflow:auto"><table class="table" style="min-width:700px"><thead><tr><th>Обозначение</th><th>Наименование</th><th>Ссылка</th><th>Вкл.</th><th></th></tr></thead><tbody>${d.library.map(l=>`<tr><td class="code">${esc(l.designation)}</td><td>${esc(l.title)}</td><td class="kind">${l.url?`<a href="${esc(l.url)}" target="_blank">открыть</a>`:''}</td><td>${l.active?'да':'нет'}</td><td class="ws"><button class="btn small" onclick='wz2NormLibEdit(${JSON.stringify(l).replace(/'/g,"&#39;")})'>Изменить</button></td></tr>`).join('')}</tbody></table></div><div class="dialogactions"><button class="btn" onclick="wz2NormLibEdit(null)">+ документ</button><button class="btn" onclick="closeModal()">Закрыть</button></div></div>`)}catch(e){toast(e.message,true)}}
 function wz2NormLibEdit(l){l=l||{designation:'',title:'',url:'',nets:'НВК',applies:'',active:1};openModal(`<h2>${l.id?'Документ библиотеки':'Новый документ'}</h2><div class="field"><label>Обозначение</label><input id="nlD" value="${esc(l.designation)}" placeholder="СП 129.13330.2019"></div><div class="field"><label>Наименование</label><input id="nlT" value="${esc(l.title)}"></div><div class="field"><label>Ссылка</label><input id="nlU" value="${esc(l.url)}"></div><div class="field"><label>Применимость</label><input id="nlA" value="${esc(l.applies||'')}" placeholder="трубы ПЭ, испытания…"></div><label class="checkrow"><input type="checkbox" id="nlOn" ${l.active?'checked':''}> подставлять в разделы</label><div class="dialogactions">${l.id?`<button class="btn" onclick="wz2NormLibDel('${l.id}')">Удалить</button>`:''}<button class="btn" onclick="wz2NormLib()">Назад</button><button class="btn primary" onclick="wz2NormLibSave('${l.id||''}')">Сохранить</button></div>`)}
 async function wz2NormLibSave(id){const g=k=>document.getElementById(k).value;try{const r=await api('/api/wz2/normlib'+(id?'/'+id:''),{method:id?'PUT':'POST',body:JSON.stringify({designation:g('nlD'),title:g('nlT'),url:g('nlU'),applies:g('nlA'),nets:'НВК',active:document.getElementById('nlOn').checked})});toast(r.message);wz2NormLib()}catch(e){toast(e.message,true)}}

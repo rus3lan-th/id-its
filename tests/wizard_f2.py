@@ -110,9 +110,9 @@ print("    ", r["message"])
 mats = {m["key"]: m for m in P.get("/api/wz2/items" + q + "&layer=material").json()["items"]}
 objs = [o for o in P.get("/api/wz2/items" + q + "&layer=object").json()["items"] if o["state"] != "rejected" and not o["scope"]]
 import re as _re
-n1500 = sum(1 for o in objs if _re.search(r"(?i)колод.*(1500|1,5)", o["kind"] + " " + o["name"]))
+n1500 = sum(1 for o in objs if _re.search(r"(?i)колод.*(1500|1,5)", o["kind"] + " " + o["name"])) + sum(v["assumed"] for k, v in r.get("rings", {}).items() if k == "КС15")  # + колодцы без типа, принятые Ø1500 по сети (v.92)
 check("труба|гофр.|800" in mats and (mats["труба|гофр.|800"]["qty"] or 0) > 100, f"труба гофр. Ø800 по длинам участков: {mats.get('труба|гофр.|800', {}).get('qty')} м")
-check(mats.get("жби|ПН15", {}).get("qty") == n1500, f"плиты днища ПН15 = колодцев Ø1500: {mats.get('жби|ПН15', {}).get('qty')} / {n1500}")
+check(mats.get("жби|ПН15", {}).get("qty") == n1500, f"плиты днища ПН15 = колодцев Ø1500 (с принятыми по сети): {mats.get('жби|ПН15', {}).get('qty')} / {n1500}")
 check(any(k.startswith("dxf|") or mats[k]["qty"] is None for k in mats), f"упоминания в DXF без количества тоже в ведомости ({sum(1 for k in mats if mats[k]['qty'] is None)})")
 m800 = mats["труба|гофр.|800"]
 P.put(f"/api/wz2/items/{m800['id']}", json={"layer": "material", "qty": 500.0})
