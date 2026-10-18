@@ -24,7 +24,7 @@ import threading
 import uuid
 import zipfile
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal, Optional
 
@@ -36,7 +36,7 @@ from pydantic import BaseModel, Field
 
 DB_PATH = Path(os.getenv("APP_DB_PATH", "/data/id_nvk.sqlite3"))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-app = FastAPI(title="ИД ИТС · НВК", version="2026.10.18.90")
+app = FastAPI(title="ИД ИТС · НВК", version="2026.10.18.91")
 
 
 # ---------- Доступ: логин и пароль (HTTP Basic), пароль хранится только в виде хеша ----------
@@ -311,6 +311,7 @@ async def _request_scopes(request: Request) -> set[tuple[str, str]]:
 # Что может делать прораб на сервере (кроме чтения): отметки работ, фото, записи входного контроля.
 _WRITE_RULES: list[tuple[str, Any, set[str]]] = [
     ("POST", re.compile(r"^/api/events$"), {"pto", "foreman"}),
+    ("POST", re.compile(r"^/api/wz2/notices/[^/]+/seen$"), {"pto", "foreman", "manager", "surveyor", "other"}),
     ("POST", re.compile(r"^/api/photos$"), {"pto", "foreman"}),
     ("DELETE", re.compile(r"^/api/photos/"), {"pto", "foreman"}),
     ("POST", re.compile(r"^/api/vhk$"), {"pto", "foreman"}),
@@ -1533,6 +1534,7 @@ def overview(request: Request, section: Optional[str] = None) -> dict[str, Any]:
                    "system": s["system"], "revision": rev["revision"] if rev else "—", "project_id": s["project_id"]}
         return {"project": project, "elements": total, "operations": ops, "completed": done, "documents_pending": docs,
                 "list_locked": locked, "list_locked_msg": LIST_LOCKED_MSG if locked else "",
+                "wz_notices": _wz2_notices_for(c, sid, getattr(request.state, "user", "") or ""),
                 "schema_version": ver, "missing_roles": _missing_roles(c, s["project_id"]),
                 "out_of_order": c.execute("""SELECT COUNT(*) FROM events e JOIN operations o ON o.id=e.operation_id JOIN elements el ON el.id=o.element_id
                                           WHERE el.section_id=? AND e.note LIKE '[ВНЕ ОЧЕРЕДИ]%'""", (sid,)).fetchone()[0],
@@ -3694,6 +3696,11 @@ def backup_full(request: Request) -> StreamingResponse:
 
 # ---------------------------------------------------------------- Что нового (окно после обновления программы)
 RELEASE_NOTES: list[tuple[str, list[str]]] = [
+    ("2026.10.18.91", ["Мастер «Перечень работ» 2.0: подшаг 1.1 «Нормативы» — библиотека по умолчанию для НВК (СП 129.13330.2019, СП 31.13330.2021, СП 32.13330.2018, СП 8.13130.2020, ГОСТ 21.704-2011, ПП РФ №87; редактируется) и ссылки, найденные в чертежах DXF.",
+                       "Подшаг 1.3 «Материалы»: ведомость материалов по перечню (трубы — по длинам участков, изделия колодцев — по типу колодца) и упоминаниям в DXF; количество можно поправить.",
+                       "Подшаг 1.4 «Замечания и сверка»: сверка материалов проекта со сметой (по ведомости, порог 3 %, с учётом потерь) — расхождения сразу становятся замечаниями; справка замечаний с трудоёмкостью в чел.-ч, выгрузка в CSV для Google Таблиц.",
+                       "Таблица норм трудоёмкости: заполняется из ГЭСН (затраты труда рабочих), нормы можно исправить или добавить свои.",
+                       "Откат шагов 3–4 (сопоставление со сметой) к снимку; прораб получает уведомление, если ПТО откатил или обновил переданный ему перечень."]),
     ("2026.10.18.90", ["Мастер «Перечень работ» 2.0 (каркас): шаг 1 с подшагами (источники, нормативы, виды работ и объёмы, материалы, замечания), шаг 2 — группы работ, задаваемые пользователем (колодец, узел, секция, щит).",
                        "Рабочий перечень отделён от перечня прораба: изменения попадают к прорабу только при подтверждении шага. Массовые действия: принять, отклонить, «не делаем», «другой подрядчик», перенести в группу.",
                        "Снимки при каждом подтверждении и перед каждым откатом. Откат шага целиком или частично (выделенные пункты, группа, файл-источник) с обязательной причиной; если затронуты отметки прораба — нужно подтверждение, отметки сохраняются в истории.",
@@ -5841,6 +5848,7 @@ def wizard_step(request: Request, p: WizStep, section: Optional[str] = None) -> 
             if st["steps"][3]["status"] == "locked":
                 raise HTTPException(409, "Сначала выполните автоматическое сопоставление (шаг 3)")
             _wiz_set(c, sid, s4_at=now(), s4_by=who, s4_fp=_match_fp(c, sid), handed_at=now(), handed_by=who)
+            _wz2_snapshot(c, sid, 4, "confirm", "Шаг 4 завершён — передано прорабу", who or "ПТО")
         audit(request, c, "wizard", sid, f"step{p.step}", f"Мастер перечня: шаг {p.step} «{s['title']}» выполнен", section_id=sid)
         return _wizard_state(c, sec)
 
@@ -5854,11 +5862,13 @@ def wizard_match(request: Request, section: Optional[str] = None) -> dict[str, A
         st = _wizard_state(c, sec)
         if st["steps"][2]["status"] == "locked":
             raise HTTPException(409, "Сначала подтвердите перечень (шаг 2)")
+        _wz2_snapshot(c, sec["id"], 3, "before-auto", "Перед автосопоставлением", who or "ПТО")
         res = _alloc_auto_core(c, sec, who, 0)
     mc = _match_counts(sec["id"])
     with db() as c:
         _wiz_set(c, sec["id"], s3_at=now(), s3_by=who, s3_fp=_match_fp(c, sec["id"]), s3_json=json.dumps({**{k: res.get(k) for k in ("done", "needs_pto")}, **mc, "message": res.get("message", "")[:400]}, ensure_ascii=False),
                  s4_at="", s4_by="", s4_fp="")
+        _wz2_snapshot(c, sec["id"], 3, "confirm", "Автосопоставление выполнено", who or "ПТО")
         audit(request, c, "wizard", sec["id"], "step3", f"Мастер перечня: автосопоставление — работ {mc['works_ok']}/{mc['works']}, объектов {mc['objects_ok']}/{mc['objects']}", section_id=sec["id"])
         return {"message": res.get("message", ""), "counters": mc, "state": _wizard_state(c, sec)}
 
@@ -5949,7 +5959,7 @@ CREATE TABLE IF NOT EXISTS wz_state (
 );
 """
 WZ2_STEPS = [("1", "Перечень работ по проекту"), ("2", "Укрупнённый состав"), ("3", "Сопоставление со сметой"), ("4", "Ручное сопоставление")]
-WZ2_SUB = [("1.0", "Источники", "Ф0"), ("1.1", "Нормативы", "Ф1"), ("1.2", "Виды работ и объёмы", "Ф0"), ("1.3", "Материалы", "Ф2"), ("1.4", "Замечания", "Ф3")]
+WZ2_SUB = [("1.0", "Источники", "Ф0"), ("1.1", "Нормативы", "Ф2"), ("1.2", "Виды работ и объёмы", "Ф0"), ("1.3", "Материалы", "Ф2"), ("1.4", "Замечания и сверка", "Ф2")]
 _WZ_ITEM_COLS = ("id", "section_id", "layer", "key", "parent_id", "name", "kind", "unit", "qty", "note", "data_json", "source_file_id", "locator", "origin", "state", "scope",
                  "element_id", "operation_id", "sort", "run_id", "updated_by", "updated_at")
 _WZ_GROUP_COLS = ("id", "section_id", "name", "kind", "parent_id", "sort", "note", "origin", "updated_by", "updated_at")
@@ -6032,6 +6042,8 @@ def _wz2_adopt(c: sqlite3.Connection, sid: str, who: str = "прежний пе�
 
 
 def _wz2_rows(c: sqlite3.Connection, sid: str, step: int) -> dict[str, Any]:
+    if step in (3, 4):   # шаги 3–4: привязки сметы к объектам перечня
+        return {"alloc": [dict(r) for r in c.execute("SELECT * FROM work_alloc WHERE section_id=? ORDER BY item_key, element_id", (sid,))]}
     if step == 1:
         return {"items": [dict(r) for r in c.execute("SELECT * FROM wz_items WHERE section_id=? ORDER BY layer, sort, key", (sid,))]}
     return {"groups": [dict(r) for r in c.execute("SELECT * FROM wz_groups WHERE section_id=? ORDER BY sort, name", (sid,))],
@@ -6041,7 +6053,7 @@ def _wz2_rows(c: sqlite3.Connection, sid: str, step: int) -> dict[str, Any]:
 def _wz2_fp(c: sqlite3.Connection, sid: str, step: int) -> str:
     d = _wz2_rows(c, sid, step)
     if step == 1:
-        payload = [(r["id"], r["key"], r["parent_id"], r["name"], r["kind"], r["unit"], r["qty"], r["note"], r["state"], r["scope"]) for r in d["items"]]
+        payload = [(r["id"], r["key"], r["parent_id"], r["name"], r["kind"], r["unit"], r["qty"], r["note"], r["state"], r["scope"]) for r in d["items"] if r["layer"] in ("object", "work")]
     else:
         payload = [(g["id"], g["name"], g["kind"], g["parent_id"], g["sort"]) for g in d["groups"]] + [(m["group_id"], m["item_id"]) for m in d["members"]]
     return hashlib.sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()[:16]
@@ -6052,7 +6064,13 @@ def _wz2_stats(c: sqlite3.Connection, sid: str, step: int) -> dict[str, Any]:
         r = {f"{a}_{b}": n for a, b, n in c.execute("SELECT layer, state, COUNT(*) FROM wz_items WHERE section_id=? GROUP BY 1,2", (sid,))}
         r["objects"] = sum(v for k, v in r.items() if k.startswith("object_") and not k.endswith("rejected"))
         r["works"] = sum(v for k, v in r.items() if k.startswith("work_") and not k.endswith("rejected"))
+        r["norms"] = sum(v for k, v in r.items() if k.startswith("norm_") and not k.endswith("rejected"))
+        r["materials"] = sum(v for k, v in r.items() if k.startswith("material_") and not k.endswith("rejected"))
+        r["remarks_open"] = c.execute("SELECT COUNT(*) FROM wz_remarks WHERE section_id=? AND status IN ('open','clarify')", (sid,)).fetchone()[0] if c.execute("SELECT 1 FROM sqlite_master WHERE name='wz_remarks'").fetchone() else 0
         return r
+    if step in (3, 4):
+        return {"alloc": c.execute("SELECT COUNT(*) FROM work_alloc WHERE section_id=?", (sid,)).fetchone()[0],
+                "manual": c.execute("SELECT COUNT(*) FROM work_alloc WHERE section_id=? AND mode<>'auto'", (sid,)).fetchone()[0]}
     return {"groups": c.execute("SELECT COUNT(*) FROM wz_groups WHERE section_id=?", (sid,)).fetchone()[0],
             "members": c.execute("SELECT COUNT(*) FROM wz_group_members m JOIN wz_groups g ON g.id=m.group_id WHERE g.section_id=?", (sid,)).fetchone()[0]}
 
@@ -6442,13 +6460,18 @@ def wz2_confirm(request: Request, p: Wz2Confirm, section: Optional[str] = None) 
                 r2 = c.execute("SELECT status FROM wz_state WHERE section_id=? AND step='2'", (sid,)).fetchone()
                 if r2 and r2[0] == "done" and pub:
                     c.execute("UPDATE wz_state SET status='stale', note='шаг 1 изменён — проверьте состав' WHERE section_id=? AND step='2'", (sid,))
+            if pub and _wz2_handed(c, sid):
+                ru = {"el_added": "добавлено объектов", "el_changed": "изменено объектов", "el_disabled": "выведено из перечня", "op_added": "добавлено работ", "op_changed": "изменено работ",
+                      "op_removed": "удалено работ", "op_kept_marked": "оставлено работ с вашими отметками"}
+                _wz2_notice(c, sid, "publish", "Перечень работ обновлён ПТО", "Изменения: " + ", ".join(f"{ru.get(k, k)} {v}" for k, v in pub.items()) + ". Ваши отметки сохранены в истории.", who)
             audit(request, c, "wizard2", sid, f"confirm{n}", f"Мастер 2.0: подтверждён шаг {n}; публикация: {json.dumps(pub, ensure_ascii=False)}"[:300], section_id=sid)
         return {"published": pub, "state": _wz2_state(c, sec)}
 
 
 class Wz2Rollback(BaseModel):
     snapshot_id: str = Field(default="", max_length=64)
-    mode: Literal["full", "items", "group", "file"] = "full"
+    mode: Literal["full", "items", "group", "file", "layer"] = "full"
+    layer: str = Field(default="", max_length=20)
     ids: list[str] = Field(default_factory=list, max_length=5000)
     group_id: str = Field(default="", max_length=64)
     file_id: str = Field(default="", max_length=64)
@@ -6481,7 +6504,14 @@ def wz2_rollback(request: Request, p: Wz2Rollback, section: Optional[str] = None
                 raise HTTPException(422, "Выберите снимок для отката")
             snap_row, data = _wz2_load_snap(c, sid, p.snapshot_id)
             step = snap_row["step"]
-            if step == 2:
+            if step in (3, 4):
+                cur_a = {r["id"]: dict(r) for r in c.execute("SELECT * FROM work_alloc WHERE section_id=?", (sid,))}
+                en = {r[0] for r in c.execute("SELECT id FROM elements WHERE section_id=? AND enabled=1", (sid,))}
+                tgt_a = {r["id"]: r for r in data["alloc"] if r["element_id"] in en}
+                plan = {"counts": {"alloc_add": len(set(tgt_a) - set(cur_a)), "alloc_remove": len(set(cur_a) - set(tgt_a)),
+                                   "alloc_change": sum(1 for i in set(cur_a) & set(tgt_a) if any(str(cur_a[i][k]) != str(tgt_a[i][k]) for k in ("qty", "mode", "item_key", "element_id"))),
+                                   "skipped_disabled": len(data["alloc"]) - len(tgt_a)}, "marks": 0, "acts": 0}
+            elif step == 2:
                 cur_g = {r["id"] for r in c.execute("SELECT id FROM wz_groups WHERE section_id=?", (sid,))}
                 cur_m = {(r[0], r[1]) for r in c.execute("SELECT m.group_id, m.item_id FROM wz_group_members m JOIN wz_groups g ON g.id=m.group_id WHERE g.section_id=?", (sid,))}
                 tg = {g["id"] for g in data["groups"]}
@@ -6497,6 +6527,10 @@ def wz2_rollback(request: Request, p: Wz2Rollback, section: Optional[str] = None
                 if p.mode == "items":
                     ids = set(p.ids)
                     ids |= {r["id"] for r in target if r["parent_id"] in ids} | {r[0] for r in c.execute("SELECT id FROM wz_items WHERE section_id=? AND parent_id IN (%s)" % ",".join("?" * len(p.ids)), (sid, *p.ids))} if p.ids else set()
+                elif p.mode == "layer":
+                    if p.layer not in ("object", "work", "norm", "material"):
+                        raise HTTPException(422, "Не указан слой перечня")
+                    ids = {r["id"] for r in target if r["layer"] == p.layer} | {r[0] for r in c.execute("SELECT id FROM wz_items WHERE section_id=? AND layer=?", (sid, p.layer))}
                 elif p.mode == "group":
                     gm = {r[0] for r in c.execute("SELECT item_id FROM wz_group_members WHERE group_id=?", (p.group_id,))}
                     ids = gm | {r["id"] for r in target if r["parent_id"] in gm} | {r[0] for r in c.execute("SELECT id FROM wz_items WHERE section_id=? AND parent_id IN (SELECT item_id FROM wz_group_members WHERE group_id=?)", (sid, p.group_id))}
@@ -6514,7 +6548,14 @@ def wz2_rollback(request: Request, p: Wz2Rollback, section: Optional[str] = None
         if (out["marks"] or out["acts"]) and not p.confirm_marks:
             raise HTTPException(409, f"Откат затронет отметки прораба ({out['marks']}) и акты ({out['acts']}). Подтвердите: отметки сохранятся в истории, объекты уйдут из перечня после подтверждения шага.")
         before = _wz2_snapshot(c, sid, step, "before-rollback", f"Перед откатом: {p.reason.strip()}", who)
-        if step == 2 and p.mode != "file":
+        if step in (3, 4):
+            c.execute("DELETE FROM work_alloc WHERE section_id=?", (sid,))
+            for r in tgt_a.values():
+                c.execute("INSERT INTO work_alloc (id,section_id,item_key,element_id,qty,mode,updated_by,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                          (r["id"], sid, r["item_key"], r["element_id"], r["qty"], r["mode"], r["updated_by"], r["updated_at"]))
+            _wiz_set(c, sid, s3_fp=_match_fp(c, sid), s4_at="", s4_by="", s4_fp="")
+            _wz2_hist(c, sid, "*", "rollback", {"snapshot": before}, {"snapshot": p.snapshot_id}, who, p.reason, kind="alloc")
+        elif step == 2 and p.mode != "file":
             if p.mode == "group":
                 c.execute("DELETE FROM wz_group_members WHERE group_id=?", (p.group_id,))
                 c.execute("DELETE FROM wz_groups WHERE id=?", (p.group_id,))
@@ -6535,7 +6576,15 @@ def wz2_rollback(request: Request, p: Wz2Rollback, section: Optional[str] = None
             _wz2_hist(c, sid, p.group_id or "*", "rollback", {"snapshot": before}, {"snapshot": p.snapshot_id}, who, p.reason, kind="groups")
         else:
             _wz2_apply(c, sid, target, plan, who, p.reason.strip())
-        _wz2_mark_downstream(c, sid, step, f"откат: {p.reason.strip()}")
+        if step < 3 and not (p.mode == "layer" and p.layer in ("norm", "material")):   # нормативы и материалы не меняют перечень прораба
+            _wz2_mark_downstream(c, sid, step, f"откат: {p.reason.strip()}")
+        if _wz2_handed(c, sid):
+            cn = out["counts"]
+            what = (f"объектов/работ: вернётся {cn.get('add', 0)}, уберётся {cn.get('remove', 0)}, изменится {cn.get('change', 0)}" if step == 1 else
+                    f"групп +{cn.get('groups_add', 0)}/−{cn.get('groups_remove', 0)}" if step == 2 else f"привязок сметы: +{cn.get('alloc_add', 0)}/−{cn.get('alloc_remove', 0)}")
+            _wz2_notice(c, sid, "rollback", f"ПТО откатил шаг {step} перечня работ",
+                        f"Причина: {p.reason.strip()}. Изменения: {what}." + (f" Затронуто ваших отметок: {out['marks']} — они сохранены в истории." if out["marks"] else "")
+                        + (" Перечень у вас обновится после того, как ПТО заново подтвердит шаг." if step < 3 else " На перечень работ не влияет — изменено сопоставление со сметой."), who)
         audit(request, c, "wizard2", sid, "rollback", f"Мастер 2.0: откат шага {step} ({p.mode}); причина: {p.reason.strip()}; {json.dumps(out['counts'], ensure_ascii=False)}; отметок {out['marks']}"[:300], section_id=sid)
         return {**out, "undo_snapshot": before, "message": "Откат выполнен. Проверьте и подтвердите шаг заново — изменения попадут к прорабу после подтверждения.", "state": _wz2_state(c, sec)}
 
@@ -6546,6 +6595,821 @@ def wz2_history(section: Optional[str] = None, item: str = "", limit: int = 200)
         sid = _section(c, section)["id"]
         q = "SELECT id,item_id,item_kind,action,reason,by,at,before_json,after_json FROM wz_history WHERE section_id=?" + (" AND item_id=?" if item else "") + " ORDER BY at DESC LIMIT ?"
         return {"history": [dict(r) for r in c.execute(q, (sid, item, min(limit, 1000)) if item else (sid, min(limit, 1000)))]}
+
+
+# ================================================================ v.91: мастер 2.0, Ф2 — нормативы, материалы, сверка с ресурсами сметы (вариант А), замечания,
+# нормы трудоёмкости (ГЭСН и свои), уведомление прораба об откате, откат шагов 3–4
+_WZ2F_DDL = """
+CREATE TABLE IF NOT EXISTS wz_norm_library (
+  id TEXT PRIMARY KEY, designation TEXT NOT NULL UNIQUE, title TEXT NOT NULL DEFAULT '', url TEXT NOT NULL DEFAULT '', nets TEXT NOT NULL DEFAULT '',
+  applies TEXT NOT NULL DEFAULT '', active INTEGER NOT NULL DEFAULT 1, sort INTEGER NOT NULL DEFAULT 0, updated_by TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS wz_labor_norms (
+  id TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE, name TEXT NOT NULL DEFAULT '', unit TEXT NOT NULL DEFAULT '', hours REAL NOT NULL DEFAULT 0,
+  source TEXT NOT NULL DEFAULT 'своя', base_code TEXT NOT NULL DEFAULT '', gesn_hours REAL, note TEXT NOT NULL DEFAULT '', edited INTEGER NOT NULL DEFAULT 0,
+  updated_by TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS wz_remarks (
+  id TEXT PRIMARY KEY, section_id TEXT NOT NULL, no INTEGER NOT NULL DEFAULT 0, key TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'other', text TEXT NOT NULL DEFAULT '',
+  quote TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '', links_json TEXT NOT NULL DEFAULT '[]', impact_qty TEXT NOT NULL DEFAULT '', impact_mat TEXT NOT NULL DEFAULT '',
+  labor_hours REAL, labor_basis TEXT NOT NULL DEFAULT '', labor_code TEXT NOT NULL DEFAULT '', labor_qty REAL, status TEXT NOT NULL DEFAULT 'open', decision TEXT NOT NULL DEFAULT '',
+  origin TEXT NOT NULL DEFAULT 'manual', data_json TEXT NOT NULL DEFAULT '{}', created_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT '',
+  updated_by TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '', UNIQUE (section_id, key)
+);
+CREATE TABLE IF NOT EXISTS wz_notices (
+  id TEXT PRIMARY KEY, section_id TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'rollback', title TEXT NOT NULL DEFAULT '', text TEXT NOT NULL DEFAULT '', by TEXT NOT NULL DEFAULT '', at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_wz_notices ON wz_notices (section_id, at);
+CREATE TABLE IF NOT EXISTS wz_notice_seen (notice_id TEXT NOT NULL, login TEXT NOT NULL, at TEXT NOT NULL, PRIMARY KEY (notice_id, login));
+CREATE TABLE IF NOT EXISTS wz_params (section_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL DEFAULT '', PRIMARY KEY (section_id, key));
+"""
+WZ2_NORM_DEFAULT = [
+    ("СП 129.13330.2019", "Наружные сети и сооружения водоснабжения и канализации (актуализированная редакция СНиП 3.05.04-85*)", "https://docs.cntd.ru/document/565256600"),
+    ("СП 31.13330.2021", "Водоснабжение. Наружные сети и сооружения", "https://docs.cntd.ru/document/728474306"),
+    ("СП 32.13330.2018", "Канализация. Наружные сети и сооружения", ""),
+    ("СП 8.13130.2020", "Системы противопожарной защиты. Наружное противопожарное водоснабжение", ""),
+    ("ГОСТ 21.704-2011", "СПДС. Правила выполнения рабочей документации наружных сетей водоснабжения и канализации", ""),
+    ("ПП РФ №87 от 16.02.2008", "Постановление Правительства РФ «О составе разделов проектной документации и требованиях к их содержанию»", ""),
+]
+WZ2_REMARK_TYPES = {"contradiction": "противоречие", "missing": "отсутствие данных", "volume": "ошибка объёма", "norm": "несоответствие нормативу",
+                    "estimate": "расхождение проект–смета", "replace": "предложение по замене", "other": "прочее"}
+WZ2_REMARK_STATUS = {"open": "открыто", "clarify": "уточняется", "accepted": "учтено в перечне", "dropped": "снято"}
+# материалы на один объект по типу (решение ПТО может поменять в параметрах раздела, ключ mat_templates)
+WZ2_MAT_TEMPLATES = [
+    {"match": r"(?i)колод.*(1500|1,5)", "items": [["жби|ПН15", "Плита днища ПН15", "шт", 1], ["жби|2ПП15", "Плита перекрытия 2ПП15", "шт", 1], ["люк", "Люк чугунный", "шт", 1]]},
+    {"match": r"(?i)дождеприём.*1000|дождеприем.*1000", "items": [["жби|ПН10", "Плита днища ПН10", "шт", 1], ["жби|КС10.9", "Кольцо стеновое КС10.9", "шт", 1],
+                                                                ["жби|КЦП2-10", "Плита перекрытия КЦП2-10", "шт", 1], ["решетка", "Решётка дождеприёмная", "шт", 1]]},
+]
+WZ2_PARAM_DEFAULT = {"threshold_pct": "3", "losses": json.dumps({"труба": 0, "жби": 0, "люк": 0, "решетка": 0, "прочее": 0}, ensure_ascii=False),
+                     "mat_templates": json.dumps(WZ2_MAT_TEMPLATES, ensure_ascii=False)}
+_NORM_RE = re.compile(r"(?<![А-Яа-яA-Za-z])(СП|СНиП|ГОСТ\s*Р|ГОСТ|ОСТ|ТУ|СанПиН|ВСН|ТПР|[Сс]ерия)\s*(\d[\d.]*(?:\s*[-–]\s*\d{2,})*)")
+
+
+def _init_wz2f(c: sqlite3.Connection) -> None:
+    c.executescript(_WZ2F_DDL)
+    if not c.execute("SELECT 1 FROM kv WHERE k='wz_normlib_seeded'").fetchone():
+        for n, (d, t, u) in enumerate(WZ2_NORM_DEFAULT):
+            c.execute("INSERT OR IGNORE INTO wz_norm_library (id,designation,title,url,nets,active,sort,updated_by,updated_at) VALUES (?,?,?,?,?,1,?,?,?)",
+                      (str(uuid.uuid4()), d, t, u, "НВК", n, "по умолчанию (решение 18.10.2026)", now()))
+        c.execute("INSERT OR REPLACE INTO kv (k,v) VALUES ('wz_normlib_seeded', ?)", (now(),))
+    for sid in [r[0] for r in c.execute("SELECT DISTINCT section_id FROM work_alloc")]:
+        if not c.execute("SELECT 1 FROM wz_snapshots WHERE section_id=? AND step=3", (sid,)).fetchone():
+            _wz2_snapshot(c, sid, 3, "migration", "Сопоставление на момент обновления v.91", "миграция v.91")
+
+
+def _wz2_param(c: sqlite3.Connection, sid: str, key: str) -> str:
+    r = c.execute("SELECT value FROM wz_params WHERE section_id=? AND key=?", (sid, key)).fetchone()
+    return r[0] if r else WZ2_PARAM_DEFAULT.get(key, "")
+
+
+def _wz2_num(s: Any) -> Optional[float]:
+    try:
+        return float(str(s).replace(",", ".").replace(" ", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def _wz2_unit(u: str) -> tuple[float, str]:
+    """«100 м» → (100, 'м'); «м.» → (1, 'м'); «шт.» → (1, 'шт')."""
+    t = (u or "").strip().lower().replace(".", "").replace("м³", "м3").replace("м²", "м2")
+    m = re.match(r"^(\d+(?:[,.]\d+)?)?\s*(.*)$", t)
+    mult = _wz2_num(m.group(1)) if m and m.group(1) else 1.0
+    base = (m.group(2) if m else t).strip()
+    base = {"мп": "м", "пм": "м", "п м": "м", "штук": "шт", "штука": "шт", "компл": "компл", "тонн": "т"}.get(base, base)
+    return (mult or 1.0), base
+
+
+def _wz2_pipe(s: str) -> Optional[dict[str, Any]]:
+    """Тип и диаметр трубы из надписи / примечания / позиции сметы."""
+    t = (s or "").replace("%%C", "Ø").replace("%%c", "Ø")
+    tl = t.lower()
+    typ = ""
+    if "гофр" in tl or "двухслойн" in tl or "dn/od" in tl or "корсис" in tl:
+        typ = "гофр."
+    elif "пвх" in tl:
+        typ = "НПВХ"
+    elif re.search(r"пэ\s?\d{2,3}|пэ\s|пэ\b|полиэтилен", tl):
+        typ = "ПЭ"
+    elif "электросвар" in tl or "стальн" in tl:
+        typ = "сталь"
+    elif "чугун" in tl or "sml" in tl:
+        typ = "чугун"
+    dn = None
+    for rx in (r"dn/od[-\s:]*(\d{2,4})", r"d[нn]\s*(\d{2,4})", r"[øф]\s*(\d{2,4})", r"диаметр\w*[:\s]*(\d{2,4})", r"\b(\d{2,4})\s*[xх×]\s*\d"):
+        m = re.search(rx, tl)
+        if m:
+            dn = int(m.group(1))
+            break
+    if not dn:
+        return None
+    cls = ""
+    m = re.search(r"\b(sn\s?\d{1,2})\b", tl)
+    if m:
+        cls = m.group(1).upper().replace(" ", "")
+    m = re.search(r"sdr\s?(\d{1,2}(?:[,.]\d)?)", tl)
+    if m:
+        cls = (cls + " " if cls else "") + "SDR" + m.group(1).replace(",", ".")
+    return {"type": typ, "dn": dn, "cls": cls}
+
+
+def _wz2_mat_key(s: str, pipe_hint: bool = False) -> Optional[tuple[str, str, str, str]]:
+    """Устойчивый ключ материала: (ключ, наименование, единица, категория). None — не распознан (не сверяется)."""
+    t = (s or "").replace("%%C", "Ø")
+    tl = t.lower()
+    if pipe_hint or "труб" in tl or "гофр" in tl:
+        p = _wz2_pipe(t)
+        if p and "кольц" not in tl.split("труб")[0]:
+            lab = {"гофр.": "гофрированная", "НПВХ": "НПВХ", "ПЭ": "ПЭ", "сталь": "стальная электросварная", "чугун": "чугунная"}.get(p["type"], "(тип не указан)")
+            return f"труба|{p['type'] or '?'}|{p['dn']}", f"Труба {lab} Ø{p['dn']}", "м", "труба"
+    for rx, pre in ((r"\bПН\s?(\d{1,2})\b", "ПН"), (r"\bКС\s?(\d{1,2}[.,]\d{1,2})", "КС"), (r"\b(\d?)ПП\s?(\d{1,2})", "ПП"), (r"\bКЦП\s?(\d-\d{1,2})", "КЦП"), (r"\bКО\s?(\d{1,2})\b", "КО")):
+        m = re.search(rx, t)
+        if m:
+            code = (m.group(1) + "ПП" + m.group(2)) if pre == "ПП" else pre + m.group(1).replace(",", ".")
+            names = {"ПН": "Плита днища", "КС": "Кольцо стеновое", "ПП": "Плита перекрытия", "КЦП": "Плита перекрытия", "КО": "Кольцо опорное"}
+            return f"жби|{code}", f"{names[pre]} {code}", "шт", "жби"
+    if re.search(r"\bлюк", tl):
+        return "люк", "Люк чугунный", "шт", "люк"
+    if "решетк" in tl or "решётк" in tl:
+        return "решетка", "Решётка дождеприёмная", "шт", "решетка"
+    return None
+
+
+def _wz2_sec_files(c: sqlite3.Connection, sec: Any, kinds: tuple[str, ...] = ("dxf_project",)) -> list[sqlite3.Row]:
+    q = ",".join("?" * len(kinds))
+    return c.execute(f"SELECT id,name,kind FROM source_files WHERE (section_id=? OR (section_id IS NULL AND project_id=?)) AND kind IN ({q}) ORDER BY name", (sec["id"], sec["project_id"], *kinds)).fetchall()
+
+
+def _wz2_dxf_texts(fid: str) -> list[str]:
+    """Надписи DXF (кэш рядом с файлом)."""
+    p = FILES_DIR / fid
+    cache = FILES_DIR / f"{fid}.texts.json.gz"
+    try:
+        if cache.exists() and p.exists() and cache.stat().st_mtime >= p.stat().st_mtime:
+            return json.loads(gzip.decompress(cache.read_bytes()).decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        pass
+    if not p.exists():
+        return []
+    texts = [re.sub(r"\\[A-Za-z][^;\\]*;|\\P", " ", t).strip() for _x, _y, t in _dxf_texts_xy(p)]
+    try:
+        cache.write_bytes(gzip.compress(json.dumps(texts, ensure_ascii=False).encode("utf-8")))
+    except OSError:
+        pass
+    return texts
+
+
+def _wz2_norm_desig(kind: str, num: str) -> str:
+    k = re.sub(r"\s+", " ", kind.strip())
+    k = "серия" if k.lower() == "серия" else k
+    n = re.sub(r"\s*[-–]\s*", "-", num.strip()).rstrip(".-")
+    return f"{k} {n}"
+
+
+def _wz2_item_upsert(c: sqlite3.Connection, sid: str, layer: str, key: str, fields: dict[str, Any], who: str, keep_manual: bool = True) -> str:
+    """Добавить пункт или обновить автоматический (ручные правки ПТО не перетираются)."""
+    r = c.execute("SELECT * FROM wz_items WHERE section_id=? AND layer=? AND key=?", (sid, layer, key)).fetchone()
+    if r:
+        cur = dict(r)
+        upd = {k: v for k, v in fields.items() if k in ("data_json", "source_file_id", "locator") or not keep_manual or cur["state"] not in ("edited", "rejected") and cur["origin"] != "manual"}
+        if cur["state"] == "edited" and "data_json" in fields:
+            upd["data_json"] = fields["data_json"]
+        diff = {k: v for k, v in upd.items() if str(cur.get(k)) != str(v)}
+        if diff:
+            c.execute("UPDATE wz_items SET " + ",".join(f"{k}=?" for k in diff) + ", updated_by=?, updated_at=? WHERE id=?", (*diff.values(), who, now(), cur["id"]))
+        return "same" if not diff else "updated"
+    iid = str(uuid.uuid4())
+    row = {"id": iid, "section_id": sid, "layer": layer, "key": key, "parent_id": "", "name": "", "kind": "", "unit": "", "qty": None, "note": "", "data_json": "{}",
+           "source_file_id": "", "locator": "", "origin": "auto", "state": "proposed", "scope": "", "element_id": "", "operation_id": "", "sort": 0, "run_id": "",
+           "updated_by": who, "updated_at": now(), **fields}
+    _wz2_put_item(c, row)
+    _wz2_hist(c, sid, iid, "add", None, {"key": key, "name": row["name"], "layer": layer}, who, "заполнение подшага")
+    return "added"
+
+
+def _wz2_sub_touch(c: sqlite3.Connection, sid: str, sub: str, note: str) -> None:
+    r = c.execute("SELECT status FROM wz_state WHERE section_id=? AND step=?", (sid, sub)).fetchone()
+    if not r or r[0] in ("todo", "skipped", "done"):
+        c.execute("INSERT OR REPLACE INTO wz_state (section_id,step,status,note) VALUES (?,?,?,?)", (sid, sub, "work", note[:200]))
+
+
+# ---------------------------------------------------------------- 1.1 Нормативы
+@app.post("/api/wz2/norms/fill")
+def wz2_norms_fill(request: Request, section: Optional[str] = None) -> dict[str, Any]:
+    """Подшаг 1.1: библиотека по умолчанию (активные документы) + ссылки из надписей DXF раздела. Решения ПТО сохраняются."""
+    who = _who(request)
+    with db() as c:
+        sec = _section(c, section)
+        sid = sec["id"]
+        _wz2_migrate(c, sid)
+        res = collections.Counter()
+        for n, l in enumerate(c.execute("SELECT * FROM wz_norm_library WHERE active=1 ORDER BY sort, designation").fetchall()):
+            res["library_" + _wz2_item_upsert(c, sid, "norm", l["designation"], {"name": l["title"] or l["designation"], "kind": "библиотека", "origin": "library", "state": "accepted",
+                                                                              "note": l["url"], "sort": n, "data_json": json.dumps({"url": l["url"], "applies": l["applies"]}, ensure_ascii=False)}, who)] += 1
+        found: dict[str, dict[str, Any]] = {}
+        for f in _wz2_sec_files(c, sec):
+            for t in _wz2_dxf_texts(f["id"]):
+                for m in _NORM_RE.finditer(t):
+                    d = _wz2_norm_desig(m.group(1), m.group(2))
+                    x = found.setdefault(d, {"count": 0, "files": {}, "quotes": [], "file_id": f["id"]})
+                    x["count"] += 1
+                    x["files"][f["name"]] = x["files"].get(f["name"], 0) + 1
+                    if len(x["quotes"]) < 3 and t[:160] not in x["quotes"]:
+                        x["quotes"].append(t[:160])
+        lib = {r[0] for r in c.execute("SELECT key FROM wz_items WHERE section_id=? AND layer='norm' AND origin='library'", (sid,))}
+        for d, x in sorted(found.items(), key=lambda kv: -kv[1]["count"]):
+            data = json.dumps({"count": x["count"], "files": x["files"], "quotes": x["quotes"]}, ensure_ascii=False)
+            if d in lib:
+                c.execute("UPDATE wz_items SET data_json=? WHERE section_id=? AND layer='norm' AND key=?", (data, sid, d))
+                res["library_in_dxf"] += 1
+                continue
+            res["dxf_" + _wz2_item_upsert(c, sid, "norm", d, {"name": d, "kind": "из DXF", "note": "; ".join(x["quotes"][:1]), "source_file_id": x["file_id"],
+                                                           "locator": ", ".join(f"{k} ×{v}" for k, v in x["files"].items())[:300], "sort": 100, "data_json": data}, who)] += 1
+        _wz2_sub_touch(c, sid, "1.1", "заполнено: библиотека + DXF")
+        audit(request, c, "wizard2", sid, "norms_fill", f"Мастер 2.0, 1.1: нормативы — {dict(res)}"[:300], section_id=sid)
+        return {"result": dict(res), "found_in_dxf": len(found), "message": f"Нормативы: из библиотеки {sum(v for k, v in res.items() if k.startswith('library_') and k != 'library_in_dxf')}, найдено в DXF {len(found)} (новых {res.get('dxf_added', 0)})"}
+
+
+class NormLibIn(BaseModel):
+    designation: str = Field(min_length=2, max_length=120)
+    title: str = Field(default="", max_length=400)
+    url: str = Field(default="", max_length=400)
+    nets: str = Field(default="", max_length=80)
+    applies: str = Field(default="", max_length=300)
+    active: bool = True
+
+
+@app.get("/api/wz2/normlib")
+def wz2_normlib() -> dict[str, Any]:
+    with db() as c:
+        return {"library": [dict(r) for r in c.execute("SELECT * FROM wz_norm_library ORDER BY sort, designation")]}
+
+
+@app.post("/api/wz2/normlib", status_code=201)
+def wz2_normlib_add(request: Request, p: NormLibIn) -> dict[str, Any]:
+    with db() as c:
+        if c.execute("SELECT 1 FROM wz_norm_library WHERE designation=?", (p.designation.strip(),)).fetchone():
+            raise HTTPException(409, "Такой документ уже есть в библиотеке")
+        iid = str(uuid.uuid4())
+        c.execute("INSERT INTO wz_norm_library (id,designation,title,url,nets,applies,active,sort,updated_by,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                  (iid, p.designation.strip(), p.title.strip(), p.url.strip(), p.nets.strip(), p.applies.strip(), int(p.active), 50, _who(request), now()))
+        audit(request, c, "normlib", iid, "create", f"Библиотека нормативов: добавлен {p.designation}", None, project_id="_sys")
+        return {"id": iid, "message": "Добавлено в библиотеку"}
+
+
+@app.put("/api/wz2/normlib/{lid}")
+def wz2_normlib_edit(request: Request, lid: str, p: NormLibIn) -> dict[str, Any]:
+    with db() as c:
+        if not c.execute("SELECT 1 FROM wz_norm_library WHERE id=?", (lid,)).fetchone():
+            raise HTTPException(404, "Документ не найден")
+        c.execute("UPDATE wz_norm_library SET designation=?, title=?, url=?, nets=?, applies=?, active=?, updated_by=?, updated_at=? WHERE id=?",
+                  (p.designation.strip(), p.title.strip(), p.url.strip(), p.nets.strip(), p.applies.strip(), int(p.active), _who(request), now(), lid))
+        audit(request, c, "normlib", lid, "edit", f"Библиотека нормативов: изменён {p.designation}", None, project_id="_sys")
+        return {"message": "Сохранено"}
+
+
+@app.delete("/api/wz2/normlib/{lid}")
+def wz2_normlib_del(request: Request, lid: str) -> dict[str, Any]:
+    with db() as c:
+        r = c.execute("SELECT designation FROM wz_norm_library WHERE id=?", (lid,)).fetchone()
+        if not r:
+            raise HTTPException(404, "Документ не найден")
+        c.execute("DELETE FROM wz_norm_library WHERE id=?", (lid,))
+        audit(request, c, "normlib", lid, "delete", f"Библиотека нормативов: удалён {r[0]}", None, project_id="_sys")
+        return {"message": "Удалено из библиотеки (в разделах, где уже подставлен, остаётся)"}
+
+
+# ---------------------------------------------------------------- 1.3 Материалы
+def _wz2_mat_project(c: sqlite3.Connection, sec: Any) -> dict[str, Any]:
+    """Ведомость материалов по рабочему перечню: трубы — сумма длин участков по типу и диаметру; изделия колодцев — по шаблонам типа объекта; плюс упоминания в DXF."""
+    sid = sec["id"]
+    objs = [dict(r) for r in c.execute("SELECT * FROM wz_items WHERE section_id=? AND layer='object' AND state<>'rejected' AND scope=''", (sid,))]
+    try:
+        tpl = json.loads(_wz2_param(c, sid, "mat_templates"))
+    except ValueError:
+        tpl = WZ2_MAT_TEMPLATES
+    mats: dict[str, dict[str, Any]] = {}
+    no_type: list[tuple[str, int, float]] = []
+    skipped = collections.Counter()
+
+    def add(key: str, name: str, unit: str, cat: str, qty: float, obj: str, how: str) -> None:
+        m = mats.setdefault(key, {"key": key, "name": name, "unit": unit, "cat": cat, "qty": 0.0, "by": [], "how": how})
+        m["qty"] += qty
+        m["by"].append([obj, round(qty, 3)])
+
+    for o in objs:
+        txt = f"{o['name']} {o['note']}"
+        if "трубопровод" in (o["kind"] or "").lower() or re.search(r"\bL\s*=\s*\d", txt):
+            mL = re.search(r"L\s*=\s*(\d+(?:[.,]\d+)?)", txt)
+            p = _wz2_pipe(o["note"] or o["name"])
+            if not mL or not p:
+                skipped["pipe_no_data"] += 1
+                continue
+            L = _wz2_num(mL.group(1)) or 0.0
+            if not p["type"]:
+                no_type.append((o["key"], p["dn"], L))
+                continue
+            k = _wz2_mat_key(o["note"] or o["name"], pipe_hint=True)
+            if k:
+                add(k[0], k[1], k[2], k[3], L, o["key"], "сумма длин участков (L из перечня)")
+            continue
+        hit = False
+        for t in tpl:
+            if re.search(t["match"], f"{o['kind']} {o['name']}"):
+                for key, name, unit, q in t["items"]:
+                    add(key, name, unit, key.split("|")[0], float(q), o["key"], f"по типу объекта: {q} {unit} на объект")
+                hit = True
+                break
+        if not hit and "колод" in (o["kind"] or "").lower():
+            skipped["well_no_template"] += 1
+    for okey, dn, L in no_type:   # тип не указан: относим к единственному типу того же диаметра
+        cand = [k for k in mats if k.startswith("труба|") and k.endswith(f"|{dn}")]
+        if len(cand) == 1:
+            mats[cand[0]]["qty"] += L
+            mats[cand[0]]["by"].append([okey, round(L, 3), "тип трубы не указан — отнесено по диаметру"])
+        else:
+            add(f"труба|?|{dn}", f"Труба (тип не указан) Ø{dn}", "м", "труба", L, okey, "тип трубы не указан")
+    dxf: dict[str, dict[str, Any]] = {}
+    for f in _wz2_sec_files(c, sec):
+        for t in _wz2_dxf_texts(f["id"]):
+            if not re.search(r"(?i)труб|бетон|праймер|мастик|кольц|плит|люк|щеб[её]н|песо[кч]|решетк|решётк", t) or len(t) > 200:
+                continue
+            k = _wz2_mat_key(t)
+            key, name, cat = (k[0], k[1], k[3]) if k else ("dxf|" + re.sub(r"\s+", " ", t.strip().lower())[:80], re.sub(r"\s+", " ", t.strip())[:120], "прочее")
+            if not k and not re.search(r"(?i)^(бетон|праймер|мастик|щеб|песо|труба|кольцо|плита|люк)", t.strip()):
+                continue
+            x = dxf.setdefault(key, {"name": name, "cat": cat, "count": 0, "file": f["id"], "fname": f["name"]})
+            x["count"] += 1
+    return {"mats": mats, "dxf": dxf, "skipped": dict(skipped)}
+
+
+@app.post("/api/wz2/materials/fill")
+def wz2_mat_fill(request: Request, section: Optional[str] = None) -> dict[str, Any]:
+    """Подшаг 1.3: ведомость материалов проекта (рабочий перечень + надписи DXF). Ручные правки количества сохраняются."""
+    who = _who(request)
+    with db() as c:
+        sec = _section(c, section)
+        sid = sec["id"]
+        _wz2_migrate(c, sid)
+        pm = _wz2_mat_project(c, sec)
+        res = collections.Counter()
+        for n, m in enumerate(sorted(pm["mats"].values(), key=lambda x: x["key"])):
+            data = {"computed_qty": round(m["qty"], 3), "by": m["by"][:400], "how": m["how"], "cat": m["cat"], "dxf_mentions": pm["dxf"].get(m["key"], {}).get("count", 0)}
+            res[_wz2_item_upsert(c, sid, "material", m["key"], {"name": m["name"], "unit": m["unit"], "qty": round(m["qty"], 3), "kind": m["cat"], "sort": n,
+                                                                "note": f"{m['how']}; объектов {len(m['by'])}", "data_json": json.dumps(data, ensure_ascii=False)}, who)] += 1
+        for key, x in pm["dxf"].items():
+            if key in pm["mats"]:
+                continue
+            res["dxf_" + _wz2_item_upsert(c, sid, "material", key, {"name": x["name"], "unit": "", "qty": None, "kind": x["cat"], "sort": 500, "source_file_id": x["file"],
+                                                                 "note": f"упоминается в DXF ({x['fname']}) ×{x['count']}; количество в перечне не определено",
+                                                                 "data_json": json.dumps({"dxf_mentions": x["count"], "cat": x["cat"]}, ensure_ascii=False)}, who)] += 1
+        _wz2_sub_touch(c, sid, "1.3", "ведомость материалов заполнена")
+        sk = pm["skipped"]
+        audit(request, c, "wizard2", sid, "materials_fill", f"Мастер 2.0, 1.3: материалы — {dict(res)}; пропущено {sk}"[:300], section_id=sid)
+        return {"result": dict(res), "skipped": sk, "message": f"Материалы: из перечня {len(pm['mats'])} позиций, упоминаний в DXF {len(pm['dxf'])}"
+                + (f"; участков без длины или диаметра: {sk.get('pipe_no_data', 0)}" if sk.get("pipe_no_data") else "")
+                + (f"; колодцев без шаблона материалов: {sk.get('well_no_template', 0)}" if sk.get("well_no_template") else "")}
+
+
+# ---------------------------------------------------------------- трудоёмкость (чел.-ч): своя норма или ГЭСН
+def _wz2_gesn_labor(c: sqlite3.Connection, code: str) -> Optional[dict[str, Any]]:
+    code = re.sub(r"^ГЭСН(?=\d)", "", _norm_code(code)) if code else ""
+    if not code:
+        return None
+    r = (c.execute("SELECT base,code,unit,res_json,table_name,end_name FROM norm_records WHERE base='ГЭСН' AND code=?", (code,)).fetchone()
+         or c.execute("SELECT base,code,unit,res_json,table_name,end_name FROM norm_records WHERE code=? LIMIT 1", (code,)).fetchone())
+    if not r:
+        return None
+    res = json.loads(r["res_json"] or "[]")
+    tot = next((x for x in res if str(x.get("code", "")) == "1"), None)   # «1» — итог затрат труда рабочих (тогда разряды идут строками 2-100-…)
+    hrs = (_wz2_num(tot.get("qty")) or 0.0) if tot else sum(_wz2_num(x.get("qty")) or 0.0 for x in res if str(x.get("code", "")).startswith("1-"))
+    return {"code": r["code"], "base": r["base"], "unit": r["unit"], "hours": round(hrs, 4), "name": f"{r['table_name']} {r['end_name']}".strip()[:300]}
+
+
+def _wz2_labor(c: sqlite3.Connection, code: str) -> Optional[dict[str, Any]]:
+    """Норма трудоёмкости по шифру: сначала таблица норм (своя или скопированная из ГЭСН и, возможно, исправленная ПТО), затем индекс ГЭСН."""
+    if not code:
+        return None
+    for k in (code, _norm_code(code)):
+        r = c.execute("SELECT * FROM wz_labor_norms WHERE code=?", (k,)).fetchone()
+        if r:
+            return {"code": r["code"], "unit": r["unit"], "hours": r["hours"], "source": r["source"] + (" (исправлена)" if r["edited"] else ""), "name": r["name"]}
+    g = _wz2_gesn_labor(c, code)
+    return {**g, "source": "ГЭСН"} if g else None
+
+
+def _wz2_labor_calc(c: sqlite3.Connection, code: str, qty: Optional[float], qty_unit: str = "") -> tuple[Optional[float], str]:
+    """чел.-ч на объём qty (в единицах qty_unit; если пусто — в единицах нормы)."""
+    n = _wz2_labor(c, code)
+    if not n or qty is None:
+        return None, ("норма не найдена: " + code) if code and not n else ""
+    mult, base = _wz2_unit(n["unit"])
+    per = n["hours"] / (mult or 1)
+    _qm, qb = _wz2_unit(qty_unit) if qty_unit else (mult, base)
+    if qty_unit and qb != base:
+        return None, f"{n['source']} {n['code']}: норма на {n['unit']}, объём в «{qb}» — пересчёт единиц не выполняется, укажите норму или объём вручную"
+    q = qty * (_qm if qty_unit else mult)
+    h = round(abs(q) * per, 2)
+    return h, f"{n['source']} {n['code']}: {n['hours']:g} чел.-ч на {n['unit']} × {abs(q):g} {base} = {h:g} чел.-ч"
+
+
+class LaborIn(BaseModel):
+    code: str = Field(min_length=1, max_length=60)
+    name: str = Field(default="", max_length=300)
+    unit: str = Field(default="", max_length=30)
+    hours: float = Field(ge=0, le=100000)
+    note: str = Field(default="", max_length=400)
+
+
+@app.get("/api/labor-norms")
+def labor_norms(q: str = "", limit: int = 300) -> dict[str, Any]:
+    with db() as c:
+        ql = f"%{q.strip()}%"
+        rows = [dict(r) for r in c.execute("SELECT * FROM wz_labor_norms WHERE (?='' OR code LIKE ? OR name LIKE ?) ORDER BY source, code LIMIT ?", (q.strip(), ql, ql, max(1, min(limit, 2000))))]
+        return {"norms": rows, "total": c.execute("SELECT COUNT(*) FROM wz_labor_norms").fetchone()[0],
+                "gesn_loaded": c.execute("SELECT COUNT(*) FROM norm_records").fetchone()[0]}
+
+
+@app.get("/api/labor-norms/lookup")
+def labor_lookup(code: str, qty: Optional[float] = None, unit: str = "") -> dict[str, Any]:
+    with db() as c:
+        n = _wz2_labor(c, code)
+        h, basis = _wz2_labor_calc(c, code, qty, unit) if qty is not None else (None, "")
+        return {"norm": n, "hours": h, "basis": basis}
+
+
+@app.post("/api/labor-norms", status_code=201)
+def labor_add(request: Request, p: LaborIn) -> dict[str, Any]:
+    with db() as c:
+        if c.execute("SELECT 1 FROM wz_labor_norms WHERE code=?", (p.code.strip(),)).fetchone():
+            raise HTTPException(409, "Норма с таким шифром уже есть — измените её")
+        iid = str(uuid.uuid4())
+        c.execute("INSERT INTO wz_labor_norms (id,code,name,unit,hours,source,note,updated_by,updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                  (iid, p.code.strip(), p.name.strip(), p.unit.strip(), p.hours, "своя", p.note.strip(), _who(request), now()))
+        audit(request, c, "labor_norm", iid, "create", f"Нормы трудоёмкости: своя норма {p.code} — {p.hours} чел.-ч на {p.unit}", None, project_id="_sys")
+        return {"id": iid, "message": "Норма добавлена"}
+
+
+@app.put("/api/labor-norms/{nid}")
+def labor_edit(request: Request, nid: str, p: LaborIn) -> dict[str, Any]:
+    with db() as c:
+        r = c.execute("SELECT * FROM wz_labor_norms WHERE id=?", (nid,)).fetchone()
+        if not r:
+            raise HTTPException(404, "Норма не найдена")
+        edited = int(r["source"] == "ГЭСН" and (abs((r["gesn_hours"] or 0) - p.hours) > 1e-9 or p.unit.strip() != r["unit"]))
+        c.execute("UPDATE wz_labor_norms SET code=?, name=?, unit=?, hours=?, note=?, edited=?, updated_by=?, updated_at=? WHERE id=?",
+                  (p.code.strip(), p.name.strip(), p.unit.strip(), p.hours, p.note.strip(), edited, _who(request), now(), nid))
+        audit(request, c, "labor_norm", nid, "edit", f"Нормы трудоёмкости: {p.code} — {r['hours']} → {p.hours} чел.-ч на {p.unit}", None, project_id="_sys")
+        return {"message": "Сохранено"}
+
+
+@app.delete("/api/labor-norms/{nid}")
+def labor_del(request: Request, nid: str) -> dict[str, Any]:
+    with db() as c:
+        r = c.execute("SELECT code FROM wz_labor_norms WHERE id=?", (nid,)).fetchone()
+        if not r:
+            raise HTTPException(404, "Норма не найдена")
+        c.execute("DELETE FROM wz_labor_norms WHERE id=?", (nid,))
+        audit(request, c, "labor_norm", nid, "delete", f"Нормы трудоёмкости: удалена {r[0]}", None, project_id="_sys")
+        return {"message": "Удалено (для ГЭСН снова будет браться индекс норм)"}
+
+
+def _labor_seed_core(c: sqlite3.Connection, cols: str, who: str) -> dict[str, int]:
+    codes = {re.sub(r"^ГЭСН(?=\d)", "", r[0]) for r in c.execute("SELECT DISTINCT norm_code FROM estimate_rows WHERE norm_code<>''")}
+    for col in [x.strip() for x in cols.split(",") if x.strip()]:
+        codes |= {r[0] for r in c.execute("SELECT code FROM norm_records WHERE base='ГЭСН' AND collection=?", (col,))}
+    res: collections.Counter = collections.Counter()
+    for code in sorted(codes):
+        g = _wz2_gesn_labor(c, code)
+        if not g:
+            res["not_in_gesn"] += 1
+            continue
+        r = c.execute("SELECT * FROM wz_labor_norms WHERE code=?", (g["code"],)).fetchone()
+        if r and (r["edited"] or r["source"] != "ГЭСН"):
+            res["kept_edited"] += 1
+            continue
+        if r:
+            if abs((r["hours"] or 0) - g["hours"]) > 1e-9 or r["unit"] != g["unit"]:
+                c.execute("UPDATE wz_labor_norms SET hours=?, gesn_hours=?, unit=?, name=?, updated_by=?, updated_at=? WHERE id=?", (g["hours"], g["hours"], g["unit"], g["name"], who, now(), r["id"]))
+                res["updated"] += 1
+            continue
+        c.execute("INSERT INTO wz_labor_norms (id,code,name,unit,hours,source,base_code,gesn_hours,note,updated_by,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                  (str(uuid.uuid4()), g["code"], g["name"], g["unit"], g["hours"], "ГЭСН", g["code"], g["hours"], "затраты труда рабочих по ГЭСН", who, now()))
+        res["added"] += 1
+    return dict(res)
+
+
+@app.post("/api/labor-norms/seed")
+def labor_seed(request: Request, cols: str = "01,22,23") -> dict[str, Any]:
+    """Заполнить таблицу норм из индекса ГЭСН: все шифры из смет программы + сборники (по умолчанию 01 земляные, 22 водопровод, 23 канализация).
+    Исправленные ПТО и свои нормы не перезаписываются."""
+    with db() as c:
+        if not c.execute("SELECT 1 FROM norm_records LIMIT 1").fetchone():
+            raise HTTPException(409, "Индекс ГЭСН не загружен: Справочники → Нормативная база → загрузить ГЭСН.xml")
+        res = collections.Counter(_labor_seed_core(c, cols, _who(request)))
+        audit(request, c, "labor_norm", "*", "seed", f"Нормы трудоёмкости из ГЭСН: {dict(res)}", None, project_id="_sys")
+        return {"result": dict(res), "message": f"Из ГЭСН добавлено {res['added']}, обновлено {res['updated']}, исправленных ПТО сохранено {res['kept_edited']}"}
+
+
+# ---------------------------------------------------------------- сверка материалов проект–смета, вариант А
+def _wz2_est_rows(c: sqlite3.Connection, sid: str) -> list[dict[str, Any]]:
+    return [dict(r) for r in c.execute("""SELECT r.*, r.rowid rn, e.title est_title FROM estimate_rows r JOIN estimate_revisions v ON v.id=r.revision_id JOIN estimates e ON e.id=v.estimate_id
+                                          WHERE e.section_id=? AND v.is_current=1 ORDER BY e.title, r.rowid""", (sid,))]
+
+
+def _wz2_compare(c: sqlite3.Connection, sid: str) -> dict[str, Any]:
+    thr = _wz2_num(_wz2_param(c, sid, "threshold_pct")) or 3.0
+    try:
+        losses = json.loads(_wz2_param(c, sid, "losses"))
+    except ValueError:
+        losses = {}
+    proj = {r["key"]: dict(r) for r in c.execute("SELECT * FROM wz_items WHERE section_id=? AND layer='material' AND state<>'rejected' AND scope=''", (sid,))}
+    est: dict[str, dict[str, Any]] = {}
+    unrec: list[dict[str, Any]] = []
+    last_work: dict[str, Any] = {}
+    for r in _wz2_est_rows(c, sid):
+        if r["kind"] == "work":
+            last_work = r
+            continue
+        if r["kind"] != "material":
+            continue
+        q = _wz2_num(r["qty"]) or 0.0
+        mult, base = _wz2_unit(r["unit"])
+        k = _wz2_mat_key(r["name"])
+        row = {"n": r["n"], "name": r["name"], "unit": r["unit"], "qty": q, "chapter": r["chapter"], "estimate": r["est_title"], "row_uid": r["row_uid"],
+               "work_code": last_work.get("norm_code") or "", "work_name": (last_work.get("name") or "")[:120]}
+        if not k:
+            unrec.append(row)
+            continue
+        x = est.setdefault(k[0], {"key": k[0], "name": k[1], "unit": k[2], "cat": k[3], "qty": 0.0, "rows": [], "unit_ok": True})
+        if base not in (k[2], ""):
+            x["unit_ok"] = False
+        x["qty"] += q * mult
+        x["rows"].append(row)
+    out = []
+    for key in sorted(set(proj) | set(est)):
+        p, e = proj.get(key), est.get(key)
+        if p and p["qty"] is None and not e:
+            continue   # упоминание в DXF без количества — не сверяем
+        cat = (e or {}).get("cat") or (p and json.loads(p["data_json"] or "{}").get("cat")) or "прочее"
+        loss = float(losses.get(cat, losses.get("прочее", 0)) or 0)
+        pq = p["qty"] if p and p["qty"] is not None else None
+        need = round(pq * (1 + loss / 100), 3) if pq is not None else None
+        eq = round(e["qty"], 3) if e else None
+        diff = round(eq - need, 3) if (eq is not None and need is not None) else None
+        pct = round(diff / need * 100, 1) if diff is not None and need else None
+        if pq is None and e:
+            st = "estimate_only"
+        elif e is None:
+            st = "project_only"
+        elif not e["unit_ok"]:
+            st = "unit"
+        elif abs(pct or 0) <= thr:
+            st = "ok"
+        else:
+            st = "over" if diff > 0 else "under"
+        out.append({"key": key, "name": (p or e)["name"], "unit": (p or e)["unit"], "cat": cat, "project": pq, "loss_pct": loss, "need": need, "estimate": eq, "diff": diff, "pct": pct,
+                    "status": st, "rows": (e or {}).get("rows", []), "item_id": p["id"] if p else ""})
+    return {"rows": out, "unrecognized": unrec, "threshold_pct": thr, "losses": losses}
+
+
+WZ2_CMP_ST = {"ok": "в пределах порога", "over": "в смете больше", "under": "в смете меньше", "project_only": "нет в смете", "estimate_only": "нет в проекте", "unit": "разные единицы"}
+
+
+def _wz2_remark_no(c: sqlite3.Connection, sid: str) -> int:
+    return (c.execute("SELECT MAX(no) FROM wz_remarks WHERE section_id=?", (sid,)).fetchone()[0] or 0) + 1
+
+
+def _fmt(x: Optional[float]) -> str:
+    return "—" if x is None else (f"{x:,.3f}".rstrip("0").rstrip(".").replace(",", " ").replace(".", ","))
+
+
+@app.post("/api/wz2/materials/compare")
+def wz2_mat_compare(request: Request, section: Optional[str] = None, dry_run: bool = False) -> dict[str, Any]:
+    """Сверка материалов проект–смета (вариант А): по ведомости шага 1.3, в единицах проекта, с учётом потерь; расхождение больше порога — замечание."""
+    who = _who(request)
+    with db() as c:
+        sec = _section(c, section)
+        sid = sec["id"]
+        r = _wz2_compare(c, sid)
+        res = collections.Counter()
+        if not dry_run:
+            live = set()
+            for x in r["rows"]:
+                if x["status"] in ("ok",):
+                    continue
+                key = "mat|" + x["key"]
+                live.add(key)
+                if x["status"] == "project_only":
+                    text = f"{x['name']}: по проекту {_fmt(x['project'])} {x['unit']}, в смете позиции нет."
+                    impact = f"+{_fmt(x['need'])} {x['unit']} (нужно учесть в смете)"
+                elif x["status"] == "estimate_only":
+                    text = f"{x['name']}: в смете {_fmt(x['estimate'])} {x['unit']}, в ведомости проекта количество не определено."
+                    impact = f"{_fmt(x['estimate'])} {x['unit']} — проверить, откуда в смете"
+                elif x["status"] == "unit":
+                    text = f"{x['name']}: единицы сметы не совпадают с единицами проекта — сверить вручную."
+                    impact = ""
+                else:
+                    text = (f"{x['name']}: по проекту {_fmt(x['project'])} {x['unit']}" + (f" + потери {x['loss_pct']:g} % = {_fmt(x['need'])}" if x["loss_pct"] else "")
+                            + f", в смете {_fmt(x['estimate'])} {x['unit']} — {WZ2_CMP_ST[x['status']]} на {_fmt(abs(x['diff']))} {x['unit']} ({x['pct']:+g} %, порог {r['threshold_pct']:g} %).")
+                    impact = f"{x['diff']:+.3f}".replace(".", ",") + f" {x['unit']}"
+                wcode = next((w["work_code"] for w in x["rows"] if w["work_code"]), "")
+                dq = x["diff"] if x["diff"] is not None else (x["need"] if x["status"] == "project_only" else None)
+                hrs, basis = _wz2_labor_calc(c, wcode, abs(dq) if dq is not None else None, x["unit"]) if wcode else (None, "")
+                links = [{"type": "material", "key": x["key"], "item_id": x["item_id"]}] + [{"type": "estimate_row", "row_uid": w["row_uid"], "n": w["n"], "estimate": w["estimate"]} for w in x["rows"]]
+                old = c.execute("SELECT * FROM wz_remarks WHERE section_id=? AND key=?", (sid, key)).fetchone()
+                fields = {"type": "estimate", "text": text, "impact_mat": impact, "links_json": json.dumps(links, ensure_ascii=False), "source": "сверка материалов (вариант А)",
+                          "data_json": json.dumps({k: x[k] for k in ("project", "need", "estimate", "diff", "pct", "status", "loss_pct")}, ensure_ascii=False)}
+                if not old or old["labor_code"] == "":
+                    fields.update(labor_hours=hrs, labor_basis=basis, labor_code="")
+                if old:
+                    if old["status"] == "dropped" and old["origin"] == "auto" and old["decision"].startswith("расхождение устранено"):
+                        fields.update(status="open", decision="")
+                    diff = {k: v for k, v in fields.items() if str(old[k]) != str(v)}
+                    if diff:
+                        c.execute("UPDATE wz_remarks SET " + ",".join(f"{k}=?" for k in diff) + ", updated_by=?, updated_at=? WHERE id=?", (*diff.values(), who, now(), old["id"]))
+                        res["updated"] += 1
+                    continue
+                c.execute("INSERT INTO wz_remarks (id,section_id,no,key,type,text,source,links_json,impact_mat,labor_hours,labor_basis,status,origin,data_json,created_by,created_at,updated_by,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                          (str(uuid.uuid4()), sid, _wz2_remark_no(c, sid), key, "estimate", text, fields["source"], fields["links_json"], impact, hrs, basis, "open", "auto", fields["data_json"], who, now(), who, now()))
+                res["added"] += 1
+            for old in c.execute("SELECT * FROM wz_remarks WHERE section_id=? AND origin='auto' AND key LIKE 'mat|%' AND status IN ('open','clarify')", (sid,)).fetchall():
+                if old["key"] not in live:
+                    c.execute("UPDATE wz_remarks SET status='dropped', decision=?, updated_by=?, updated_at=? WHERE id=?", ("расхождение устранено (повторная сверка " + now()[:10] + ")", who, now(), old["id"]))
+                    res["closed"] += 1
+            _wz2_sub_touch(c, sid, "1.4", "сверка материалов выполнена")
+            audit(request, c, "wizard2", sid, "materials_compare", f"Мастер 2.0: сверка материалов проект–смета — замечаний {dict(res)}"[:300], section_id=sid)
+        cnt = collections.Counter(x["status"] for x in r["rows"])
+        return {**r, "summary": dict(cnt), "remarks": dict(res), "statuses": WZ2_CMP_ST,
+                "message": f"Сверено позиций: {len(r['rows'])}; в пределах порога {cnt.get('ok', 0)}; расхождений {len(r['rows']) - cnt.get('ok', 0)}" + (f"; замечаний добавлено {res['added']}, обновлено {res['updated']}, снято {res['closed']}" if not dry_run else "")}
+
+
+class Wz2Params(BaseModel):
+    threshold_pct: Optional[float] = Field(default=None, ge=0, le=100)
+    losses: Optional[dict[str, float]] = None
+
+
+@app.get("/api/wz2/params")
+def wz2_params_get(section: Optional[str] = None) -> dict[str, Any]:
+    with db() as c:
+        sid = _section(c, section)["id"]
+        return {"threshold_pct": _wz2_num(_wz2_param(c, sid, "threshold_pct")), "losses": json.loads(_wz2_param(c, sid, "losses") or "{}"), "mat_templates": json.loads(_wz2_param(c, sid, "mat_templates") or "[]")}
+
+
+@app.put("/api/wz2/params")
+def wz2_params_put(request: Request, p: Wz2Params, section: Optional[str] = None) -> dict[str, Any]:
+    with db() as c:
+        sid = _section(c, section)["id"]
+        if p.threshold_pct is not None:
+            c.execute("INSERT OR REPLACE INTO wz_params (section_id,key,value) VALUES (?,?,?)", (sid, "threshold_pct", str(p.threshold_pct)))
+        if p.losses is not None:
+            c.execute("INSERT OR REPLACE INTO wz_params (section_id,key,value) VALUES (?,?,?)", (sid, "losses", json.dumps({k[:30]: max(0.0, min(float(v), 100.0)) for k, v in p.losses.items()}, ensure_ascii=False)))
+        audit(request, c, "wizard2", sid, "params", f"Мастер 2.0: параметры сверки — порог {p.threshold_pct}, потери {p.losses}"[:300], section_id=sid)
+        return {"message": "Параметры сохранены"}
+
+
+# ---------------------------------------------------------------- 1.4 Замечания (справка для собственных нужд)
+class RemarkIn(BaseModel):
+    type: Optional[Literal["contradiction", "missing", "volume", "norm", "estimate", "replace", "other"]] = None
+    text: Optional[str] = Field(default=None, max_length=4000)
+    quote: Optional[str] = Field(default=None, max_length=2000)
+    source: Optional[str] = Field(default=None, max_length=400)
+    impact_qty: Optional[str] = Field(default=None, max_length=300)
+    impact_mat: Optional[str] = Field(default=None, max_length=300)
+    labor_code: Optional[str] = Field(default=None, max_length=60)
+    labor_qty: Optional[float] = None
+    labor_unit: Optional[str] = Field(default=None, max_length=30)
+    labor_hours: Optional[float] = Field(default=None, ge=0)
+    status: Optional[Literal["open", "clarify", "accepted", "dropped"]] = None
+    decision: Optional[str] = Field(default=None, max_length=2000)
+    links: Optional[list[dict[str, Any]]] = None
+
+
+def _wz2_remark_row(r: Any) -> dict[str, Any]:
+    d = dict(r)
+    d["code"] = f"З-{d['no']:03d}"
+    d["type_label"] = WZ2_REMARK_TYPES.get(d["type"], d["type"])
+    d["status_label"] = WZ2_REMARK_STATUS.get(d["status"], d["status"])
+    d["links"] = json.loads(d.pop("links_json") or "[]")
+    return d
+
+
+@app.get("/api/wz2/remarks")
+def wz2_remarks(section: Optional[str] = None, status: str = "") -> dict[str, Any]:
+    with db() as c:
+        sid = _section(c, section)["id"]
+        rows = [_wz2_remark_row(r) for r in c.execute("SELECT * FROM wz_remarks WHERE section_id=? AND (?='' OR status=?) ORDER BY no", (sid, status, status))]
+        tot = {"count": len(rows), "open": sum(1 for r in rows if r["status"] in ("open", "clarify")), "labor_hours": round(sum(r["labor_hours"] or 0 for r in rows if r["status"] != "dropped"), 2)}
+        return {"remarks": rows, "totals": tot, "types": WZ2_REMARK_TYPES, "statuses": WZ2_REMARK_STATUS}
+
+
+def _wz2_remark_apply(c: sqlite3.Connection, p: RemarkIn, cur: Optional[dict[str, Any]]) -> dict[str, Any]:
+    f: dict[str, Any] = {}
+    for k in ("type", "text", "quote", "source", "impact_qty", "impact_mat", "status", "decision"):
+        v = getattr(p, k)
+        if v is not None:
+            f[k] = v.strip() if isinstance(v, str) else v
+    if p.links is not None:
+        f["links_json"] = json.dumps(p.links[:200], ensure_ascii=False)
+    if p.labor_code is not None:
+        f["labor_code"] = p.labor_code.strip()
+        f["labor_qty"] = p.labor_qty
+        if p.labor_code.strip() and p.labor_qty is not None:
+            h, basis = _wz2_labor_calc(c, p.labor_code.strip(), p.labor_qty, p.labor_unit or "")
+            if h is None:
+                raise HTTPException(422, basis or "Норма трудоёмкости не найдена — добавьте свою норму в таблицу норм")
+            f.update(labor_hours=h, labor_basis=basis)
+        elif not p.labor_code.strip():
+            f.update(labor_basis="" if p.labor_hours is None else "указано вручную")
+    if p.labor_hours is not None and not (p.labor_code or "").strip():
+        f.update(labor_hours=p.labor_hours, labor_basis="указано вручную")
+    return f
+
+
+@app.post("/api/wz2/remarks", status_code=201)
+def wz2_remark_add(request: Request, p: RemarkIn, section: Optional[str] = None) -> dict[str, Any]:
+    who = _who(request)
+    with db() as c:
+        sid = _section(c, section)["id"]
+        if not (p.text or "").strip():
+            raise HTTPException(422, "Опишите замечание")
+        f = _wz2_remark_apply(c, p, None)
+        iid = str(uuid.uuid4())
+        no = _wz2_remark_no(c, sid)
+        row = {"id": iid, "section_id": sid, "no": no, "key": "manual|" + iid, "type": "other", "status": "open", "origin": "manual", "created_by": who, "created_at": now(), "updated_by": who, "updated_at": now(), **f}
+        c.execute("INSERT INTO wz_remarks (" + ",".join(row) + ") VALUES (" + ",".join("?" * len(row)) + ")", tuple(row.values()))
+        _wz2_sub_touch(c, sid, "1.4", "есть замечания")
+        audit(request, c, "wz_remark", iid, "create", f"Замечание З-{no:03d}: {f.get('text', '')[:200]}", None, section_id=sid)
+        return {"id": iid, "code": f"З-{no:03d}", "message": f"Замечание З-{no:03d} добавлено"}
+
+
+@app.put("/api/wz2/remarks/{rid}")
+def wz2_remark_edit(request: Request, rid: str, p: RemarkIn) -> dict[str, Any]:
+    who = _who(request)
+    with db() as c:
+        r = c.execute("SELECT * FROM wz_remarks WHERE id=?", (rid,)).fetchone()
+        if not r:
+            raise HTTPException(404, "Замечание не найдено")
+        f = _wz2_remark_apply(c, p, dict(r))
+        diff = {k: v for k, v in f.items() if str(r[k]) != str(v)}
+        if diff:
+            c.execute("UPDATE wz_remarks SET " + ",".join(f"{k}=?" for k in diff) + ", updated_by=?, updated_at=? WHERE id=?", (*diff.values(), who, now(), rid))
+            audit(request, c, "wz_remark", rid, "edit", f"Замечание З-{r['no']:03d}: " + ", ".join(diff)[:200], {k: [r[k], v] for k, v in diff.items()}, section_id=r["section_id"])
+        return {"message": "Сохранено" if diff else "Без изменений", "remark": _wz2_remark_row(c.execute("SELECT * FROM wz_remarks WHERE id=?", (rid,)).fetchone())}
+
+
+@app.get("/api/wz2/remarks/export.csv")
+def wz2_remarks_csv(section: Optional[str] = None) -> Response:
+    """Справка по замечаниям раздела (для собственных нужд) — CSV для Google Таблиц."""
+    import csv
+    import io
+    with db() as c:
+        sec = _section(c, section)
+        rows = [_wz2_remark_row(r) for r in c.execute("SELECT * FROM wz_remarks WHERE section_id=? ORDER BY no", (sec["id"],))]
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";")
+    w.writerow([f"Справка по замечаниям к проекту — {sec['code']} ({now()[:10]}), для собственных нужд"])
+    w.writerow(["№", "Тип", "Описание", "Цитата", "Источник", "Влияние на объём", "Влияние на материалы", "Трудоёмкость, чел.-ч", "Основание трудоёмкости", "Статус", "Решение", "Связанные пункты"])
+    for r in rows:
+        w.writerow([r["code"], r["type_label"], r["text"], r["quote"], r["source"], r["impact_qty"], r["impact_mat"], "" if r["labor_hours"] is None else str(r["labor_hours"]).replace(".", ","),
+                    r["labor_basis"], r["status_label"], r["decision"], "; ".join(str(l.get("key") or ("смета п." + str(l.get("n", "")))) for l in r["links"])])
+    w.writerow([])
+    w.writerow(["Итого замечаний", len(rows), "открыто", sum(1 for r in rows if r["status"] in ("open", "clarify")), "", "", "Σ чел.-ч (кроме снятых)",
+                str(round(sum(r["labor_hours"] or 0 for r in rows if r["status"] != "dropped"), 2)).replace(".", ",")])
+    return Response("\ufeff" + buf.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": "attachment; filename*=UTF-8''" + urllib.parse.quote(f"Справка замечаний {sec['code']}.csv")})
+
+
+# ---------------------------------------------------------------- уведомления прорабу (откат, обновление перечня)
+def _wz2_notice(c: sqlite3.Connection, sid: str, kind: str, title: str, text: str, who: str) -> str:
+    nid = str(uuid.uuid4())
+    c.execute("INSERT INTO wz_notices (id,section_id,kind,title,text,by,at) VALUES (?,?,?,?,?,?,?)", (nid, sid, kind, title[:200], text[:1500], who, now()))
+    return nid
+
+
+def _wz2_handed(c: sqlite3.Connection, sid: str) -> bool:
+    r = c.execute("SELECT handed_at FROM list_wizard WHERE section_id=?", (sid,)).fetchone()
+    return bool(r and r[0])
+
+
+def _wz2_notices_for(c: sqlite3.Connection, sid: str, login: str) -> list[dict[str, Any]]:
+    since = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    return [dict(r) for r in c.execute("""SELECT id,kind,title,text,by,at FROM wz_notices n WHERE section_id=? AND at>=?
+                                         AND NOT EXISTS (SELECT 1 FROM wz_notice_seen s WHERE s.notice_id=n.id AND s.login=?) ORDER BY at DESC LIMIT 5""", (sid, since, login or "-"))]
+
+
+@app.get("/api/wz2/notices")
+def wz2_notices(request: Request, section: Optional[str] = None, all: bool = False) -> dict[str, Any]:
+    with db() as c:
+        sid = _section(c, section)["id"]
+        if all:
+            return {"notices": [dict(r) for r in c.execute("SELECT * FROM wz_notices WHERE section_id=? ORDER BY at DESC LIMIT 100", (sid,))]}
+        return {"notices": _wz2_notices_for(c, sid, getattr(request.state, "user", "") or "")}
+
+
+@app.post("/api/wz2/notices/{nid}/seen")
+def wz2_notice_seen(request: Request, nid: str) -> dict[str, Any]:
+    with db() as c:
+        c.execute("INSERT OR IGNORE INTO wz_notice_seen (notice_id,login,at) VALUES (?,?,?)", (nid, (getattr(request.state, "user", "") or "-")[:80], now()))
+        return {"message": "Отмечено как прочитанное"}
 
 
 @app.get("/api/work-analysis")
@@ -8388,6 +9252,7 @@ def _init_v76b(c: sqlite3.Connection) -> None:
     c.executescript(_V76B_DDL)
     _init_wizard(c)
     _init_wz2(c)
+    _init_wz2f(c)
     _ensure_cols(c, "work_instances", {"kind": "TEXT NOT NULL DEFAULT 'simple'", "axis_from": "TEXT NOT NULL DEFAULT '0'", "axis_len": "TEXT NOT NULL DEFAULT ''", "axis_unit": "TEXT NOT NULL DEFAULT 'м'",
                                        "rule_id": "TEXT NOT NULL DEFAULT ''", "blockers_json": "TEXT NOT NULL DEFAULT '[]'", "approval": "TEXT NOT NULL DEFAULT 'draft'",
                                        "approved_by": "TEXT NOT NULL DEFAULT ''", "approved_at": "TEXT NOT NULL DEFAULT ''", "note": "TEXT NOT NULL DEFAULT ''"})
@@ -13098,8 +13963,8 @@ HTML = r'''<!doctype html>
 .admgrid{display:grid;grid-template-columns:1fr 1fr;gap:8px}@media(max-width:520px){.admgrid{grid-template-columns:1fr}}
 .dstat{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 12px;font-size:13px}.dstat .status{font-size:12px}
 .pinned{position:sticky;top:0;z-index:30;background:var(--bg)}@media print{.pinned{position:static}}
-.vph{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 4px}.vph img{width:54px;height:54px;object-fit:cover;border-radius:6px;border:1px solid var(--line)}.vphi{display:inline-flex;flex-direction:column;gap:3px;align-items:center}.vphi img{width:84px;height:84px}.chips2{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}.chip2{border:1px solid var(--line);background:#fff;border-radius:14px;padding:3px 10px;font-size:12px}.chip2.on{background:var(--teal);color:#fff;border-color:var(--teal)}</style></head><body><div class="app"><aside class="side"><div class="brand"><div class="logo">ИД</div><div><strong>ИД ИТС</strong><small>исполнительная документация</small></div></div><div class="navlabel">Объекты</div><input id="treeFilter" class="treefilter hidden" placeholder="Найти объект…" oninput="treeFilter=this.value;renderTree()"><div id="objTree" class="objtree"></div><button class="btn newobj" onclick="openDicts()">☰ Справочники</button><button class="btn newobj" onclick="openWizard(false)">＋ Новый проект</button><div class="sidefoot">ИД ИТС · версия __VER__</div></aside><main class="main"><div class="pinned"><header class="top"><div class="crumb deskcrumb" id="crumbText"></div><div class="crumb pick"><select id="projSel" onchange="pickProject(this.value)" title="Объект"></select><span style="padding:0 6px;color:#bbc6c9">/</span><select id="secSel" onchange="selSection(this.value)" title="Раздел проекта"></select><button class="btn small" style="margin-left:10px" onclick="openWizard(false)">＋ Новый проект</button></div><div class="person" id="personBox" onclick="togglePerson(event)" style="cursor:pointer;position:relative"><div class="avatar" id="pAv">…</div><div><b style="font-size:13px" id="pName">…</b><div style="color:var(--muted);font-size:11px" id="pSub">личный кабинет ▾</div></div><div id="pMenu" class="pmenu hidden"></div></div></header><nav class="tabs" id="tabs"></nav></div><div class="wrap"><section id="page-dashboard"><div class="heading"><div><h1 id="dashTitle">Обзор объекта</h1><div class="sub" id="dashSub"></div></div><div class="tag"><span class="dot"></span> <span id="dashTag">Пилот</span></div></div><div id="dashNotice"></div><div id="ganttBox"></div><div class="grid" id="metrics"><div class="metric card"><div class="metric-top">Объекты работ <span class="metric-icon">⌖</span></div><strong>—</strong><small>в текущем пилоте</small></div><div class="metric card"><div class="metric-top">Операции отмечены <span class="metric-icon">✓</span></div><strong>—</strong><small>из всех заведённых операций</small></div><div class="metric card"><div class="metric-top">Схема <span class="metric-icon">⌁</span></div><strong>—</strong><small>рабочая версия</small></div><div class="metric card"><div class="metric-top">Документы <span class="metric-icon">▤</span></div><strong>—</strong><small>ожидают проверки ПТО</small></div></div><div class="section"><div class="sectionhead"><h2>Ход работ по разделу</h2><button class="btn small" onclick="showPage('work')">Открыть перечень →</button></div><div class="panel tablewrap"><table class="table"><thead><tr><th>Объект</th><th>Блок</th><th>Выполнение</th><th>Состояние</th><th>Основание</th></tr></thead><tbody id="summaryRows"><tr><td colspan="5" class="loading">Загружаем данные…</td></tr></tbody></table></div></div></section>
-<section id="page-work" class="hidden"><div class="dtabs"><button class="on" onclick="showPage('work')">Выполнение</button><button onclick="showPage('analysis')">Анализ выполнения</button></div><div class="heading"><div><h1>Выполнение работ</h1><div class="sub">Прораб фиксирует фактическое выполнение по перечню ПТО</div></div><div class="tag" id="workTag">—</div></div><div class="notice">Галочка создаёт неизменяемую запись в истории. Исполнительные размеры и отметки должны поступить из проверенной съёмки; отметка о монтаже сама по себе их не подставляет.</div><div class="sectionhead"><div><h2>Перечень объектов</h2></div><div class="filters"><input id="search" placeholder="Найти колодец или участок…" oninput="renderWork()"><select id="blockFilter" onchange="renderWork()"><option value="">Все блоки</option></select></div></div><div class="panel tablewrap"><table class="table"><thead><tr><th>Объект / участок</th><th>Операция</th><th>Статус</th><th>Дата</th><th>Отметка прораба</th></tr></thead><tbody id="workRows"></tbody></table></div></section>
+.vph{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 4px}.vph img{width:54px;height:54px;object-fit:cover;border-radius:6px;border:1px solid var(--line)}.vphi{display:inline-flex;flex-direction:column;gap:3px;align-items:center}.vphi img{width:84px;height:84px}.chips2{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}.chip2{border:1px solid var(--line);background:#fff;border-radius:14px;padding:3px 10px;font-size:12px}.chip2.on{background:var(--teal);color:#fff;border-color:var(--teal)}</style></head><body><div class="app"><aside class="side"><div class="brand"><div class="logo">ИД</div><div><strong>ИД ИТС</strong><small>исполнительная документация</small></div></div><div class="navlabel">Объекты</div><input id="treeFilter" class="treefilter hidden" placeholder="Найти объект…" oninput="treeFilter=this.value;renderTree()"><div id="objTree" class="objtree"></div><button class="btn newobj" onclick="openDicts()">☰ Справочники</button><button class="btn newobj" onclick="openWizard(false)">＋ Новый проект</button><div class="sidefoot">ИД ИТС · версия __VER__</div></aside><main class="main"><div class="pinned"><header class="top"><div class="crumb deskcrumb" id="crumbText"></div><div class="crumb pick"><select id="projSel" onchange="pickProject(this.value)" title="Объект"></select><span style="padding:0 6px;color:#bbc6c9">/</span><select id="secSel" onchange="selSection(this.value)" title="Раздел проекта"></select><button class="btn small" style="margin-left:10px" onclick="openWizard(false)">＋ Новый проект</button></div><div class="person" id="personBox" onclick="togglePerson(event)" style="cursor:pointer;position:relative"><div class="avatar" id="pAv">…</div><div><b style="font-size:13px" id="pName">…</b><div style="color:var(--muted);font-size:11px" id="pSub">личный кабинет ▾</div></div><div id="pMenu" class="pmenu hidden"></div></div></header><nav class="tabs" id="tabs"></nav></div><div class="wrap"><section id="page-dashboard"><div class="wzNotice"></div><div class="heading"><div><h1 id="dashTitle">Обзор объекта</h1><div class="sub" id="dashSub"></div></div><div class="tag"><span class="dot"></span> <span id="dashTag">Пилот</span></div></div><div id="dashNotice"></div><div id="ganttBox"></div><div class="grid" id="metrics"><div class="metric card"><div class="metric-top">Объекты работ <span class="metric-icon">⌖</span></div><strong>—</strong><small>в текущем пилоте</small></div><div class="metric card"><div class="metric-top">Операции отмечены <span class="metric-icon">✓</span></div><strong>—</strong><small>из всех заведённых операций</small></div><div class="metric card"><div class="metric-top">Схема <span class="metric-icon">⌁</span></div><strong>—</strong><small>рабочая версия</small></div><div class="metric card"><div class="metric-top">Документы <span class="metric-icon">▤</span></div><strong>—</strong><small>ожидают проверки ПТО</small></div></div><div class="section"><div class="sectionhead"><h2>Ход работ по разделу</h2><button class="btn small" onclick="showPage('work')">Открыть перечень →</button></div><div class="panel tablewrap"><table class="table"><thead><tr><th>Объект</th><th>Блок</th><th>Выполнение</th><th>Состояние</th><th>Основание</th></tr></thead><tbody id="summaryRows"><tr><td colspan="5" class="loading">Загружаем данные…</td></tr></tbody></table></div></div></section>
+<section id="page-work" class="hidden"><div class="dtabs"><button class="on" onclick="showPage('work')">Выполнение</button><button onclick="showPage('analysis')">Анализ выполнения</button></div><div class="wzNotice"></div><div class="heading"><div><h1>Выполнение работ</h1><div class="sub">Прораб фиксирует фактическое выполнение по перечню ПТО</div></div><div class="tag" id="workTag">—</div></div><div class="notice">Галочка создаёт неизменяемую запись в истории. Исполнительные размеры и отметки должны поступить из проверенной съёмки; отметка о монтаже сама по себе их не подставляет.</div><div class="sectionhead"><div><h2>Перечень объектов</h2></div><div class="filters"><input id="search" placeholder="Найти колодец или участок…" oninput="renderWork()"><select id="blockFilter" onchange="renderWork()"><option value="">Все блоки</option></select></div></div><div class="panel tablewrap"><table class="table"><thead><tr><th>Объект / участок</th><th>Операция</th><th>Статус</th><th>Дата</th><th>Отметка прораба</th></tr></thead><tbody id="workRows"></tbody></table></div></section>
 <section id="page-ozhr" class="hidden"><div class="heading"><div><h1>Общий журнал работ</h1><div class="sub" id="ozhrSub">Форма по приказу Минстроя России от 02.12.2022 № 1026/пр. Раздел 3 заполняется автоматически по отметкам в «Выполнении работ»; снятая отметка убирает запись</div></div><div style="display:flex;gap:8px;align-items:center"><span class="tag" id="ozhrTag"></span><button class="btn small" onclick="ozTitleEdit()">Титульный лист…</button><a class="btn small primary" id="ozDocx" href="#" style="text-decoration:none">Скачать Word (форма 1026/пр)</a></div></div>
 <div class="dstat" id="dsOzhr"></div><div class="notice" id="ozNote" style="margin-bottom:16px">Журнал ведётся по форме приложения № 1 к приказу Минстроя России № 1026/пр. Титульный лист и разделы 1, 3, 5 заполняются автоматически (участники, команда, отметки работ, подписанные акты и выданные схемы); разделы 2, 4, 6 добавляются вручную. Для печати нажмите «Скачать Word».</div>
 <div class="panel" style="margin-bottom:16px"><div class="sectionhead"><h2>Раздел 1. Список инженерно-технического персонала лица, осуществляющего строительство</h2></div><div class="tablewrap"><table class="table"><thead><tr><th>№ п/п</th><th>Организация</th><th>Фамилия, инициалы, должность</th><th>Дата начала работ</th><th>Дата окончания</th><th>Должность, ФИО уполномоченного представителя (подпись)</th><th></th></tr></thead><tbody id="ozhrStaff"></tbody></table></div><p class="sub" style="font-size:12px;margin:8px 0 0">Список берётся из блока «Наша роль и команда» на странице объекта. Дата начала — первая отметка работ этого человека; дату окончания и подписи проставляют на бумаге.</p></div>
@@ -13129,8 +13994,8 @@ HTML = r'''<!doctype html>
 <section id="page-list" class="hidden"><div class="dtabs"><button id="swFiles2" onclick="showPage('files')">Файлы проекта</button><button id="swList2" class="on" onclick="showPage('list')">Перечень работ · каркас ИД</button><button id="swMatch" onclick="showPage('match')">Сопоставление со сметой</button></div><div class="heading"><div><h1>Перечень работ</h1><div class="sub">Что отмечает прораб: колодцы, участки, операции — для выбранного раздела</div></div><div style="display:flex;gap:8px;align-items:center"><button class="btn" onclick="openZones()" id="zBtn">Состав раздела…</button><div class="tag" id="listTag">—</div></div></div><div class="panel" id="wizBox" style="margin-bottom:16px"><div class="wizsteps" id="wizSteps"><div class="loading">Загружаем шаги…</div></div><div id="wizBody" style="margin-top:14px"></div><button class="btn hidden" id="elAddBtn" onclick="elFormToggle()">Добавить элемент вручную</button><div id="elFormBox" class="hidden" style="margin-top:14px;max-width:560px"><h3 style="margin:0 0 8px;font-size:15px">Добавить элемент вручную</h3><form id="elementForm"><div class="field"><label>Шифр на плане</label><input name="code" placeholder="К-03" required></div><div class="field"><label>Название объекта / участка</label><input name="name" placeholder="Колодец К-03" required></div><div class="field"><label>Вид элемента</label><select name="kind"><option>Колодец</option><option>Трубопровод</option><option>Узел</option><option>Камера</option><option>Выпуск</option><option>Другое</option></select></div><div class="field"><label id="elBlkLbl">Часть раздела</label><input name="block" value="Часть 1" list="blkList"></div><div class="field"><label>Примечание по проекту</label><textarea name="planned_note" placeholder="Ссылка на лист, оси, пикетаж"></textarea></div><button class="btn primary" type="submit">Добавить в перечень</button></form></div></div><div class="panel hidden" id="wizLeft" style="margin-bottom:16px"><div class="sectionhead"><h2>Остатки для ручного сопоставления</h2></div><div class="dtabs" id="ltTabs" style="margin-top:8px"></div><div class="sub" id="ltNote" style="margin:8px 0"></div><div class="tablewrap" style="max-height:60vh;overflow:auto"><table class="table" style="min-width:760px"><thead id="ltHead"></thead><tbody id="ltBody"><tr><td class="loading">Загружаем…</td></tr></tbody></table></div></div><div class="cards2"><div class="panel"><div class="sectionhead"><h2>Загрузка готового перечня</h2></div><div id="seedBox" class="sub">Загружаем список наборов…</div></div></div></section></div></main></div><div id="modal" class="hidden"></div><div id="toast" class="toast hidden"></div>
 <script>
 let elements=[], overviewData={}, projects=[], roles=[], cur={project:null,section:null};
-const SCOPED=['/api/wz2','/api/wz2/items','/api/wz2/items/bulk','/api/wz2/groups','/api/wz2/confirm','/api/wz2/rollback','/api/wz2/history','/api/wizard','/api/wizard/analyze','/api/wizard/step','/api/wizard/match','/api/wizard/list','/api/overview','/api/elements','/api/history','/api/ozhr','/api/ozhr/extra','/api/ozhr/meta','/api/ozhr/rows','/api/ozhr/staff','/api/ozhr/reassign','/api/weather','/api/weather/fill','/api/weather/coords','/api/acts','/api/acts/proposals','/api/gantt','/api/vhk','/api/vhk-expected','/api/vhk-expected/link','/api/vhk-docs','/api/vhk-docs/one','/api/vhk-docs/file','/api/vhk-docs/rows','/api/vhk-docs/links','/api/vhk-docs/class','/api/work-analysis','/api/work-analysis/facts','/api/work-analysis/fact','/api/kits','/api/estimate-relations','/api/estimate-lines/review','/api/complex-rules','/api/double-count','/api/row-card','/api/facts','/api/facts/queue','/api/ledger','/api/estimates','/api/estimate-rows','/api/works','/api/coverage','/api/norm-refs','/api/norm-reqs','/api/norm-refs/scan','/api/alloc','/api/alloc/auto','/api/alloc/confirm','/api/lab','/api/lab/rules','/api/lab/seed','/api/lab/protocols','/api/lab/file','/api/audit','/api/schemes','/api/zones','/api/zones/term','/api/zones/rename','/api/zones/delete','/api/zones/move','/api/doc-status','/api/suggest-list','/api/elements/bulk','/api/documents','/api/revisions','/api/schema-versions'];
-const SCOPED_PFX=['/api/works/','/api/kits/','/api/complex-rules/','/api/estimate-lines/'];
+const SCOPED=['/api/wz2','/api/wz2/norms/fill','/api/wz2/materials/fill','/api/wz2/materials/compare','/api/wz2/params','/api/wz2/remarks','/api/wz2/remarks/export.csv','/api/wz2/notices','/api/wz2/items','/api/wz2/items/bulk','/api/wz2/groups','/api/wz2/confirm','/api/wz2/rollback','/api/wz2/history','/api/wizard','/api/wizard/analyze','/api/wizard/step','/api/wizard/match','/api/wizard/list','/api/overview','/api/elements','/api/history','/api/ozhr','/api/ozhr/extra','/api/ozhr/meta','/api/ozhr/rows','/api/ozhr/staff','/api/ozhr/reassign','/api/weather','/api/weather/fill','/api/weather/coords','/api/acts','/api/acts/proposals','/api/gantt','/api/vhk','/api/vhk-expected','/api/vhk-expected/link','/api/vhk-docs','/api/vhk-docs/one','/api/vhk-docs/file','/api/vhk-docs/rows','/api/vhk-docs/links','/api/vhk-docs/class','/api/work-analysis','/api/work-analysis/facts','/api/work-analysis/fact','/api/kits','/api/estimate-relations','/api/estimate-lines/review','/api/complex-rules','/api/double-count','/api/row-card','/api/facts','/api/facts/queue','/api/ledger','/api/estimates','/api/estimate-rows','/api/works','/api/coverage','/api/norm-refs','/api/norm-reqs','/api/norm-refs/scan','/api/alloc','/api/alloc/auto','/api/alloc/confirm','/api/lab','/api/lab/rules','/api/lab/seed','/api/lab/protocols','/api/lab/file','/api/audit','/api/schemes','/api/zones','/api/zones/term','/api/zones/rename','/api/zones/delete','/api/zones/move','/api/doc-status','/api/suggest-list','/api/elements/bulk','/api/documents','/api/revisions','/api/schema-versions'];
+const SCOPED_PFX=['/api/wz2/notices/','/api/works/','/api/kits/','/api/complex-rules/','/api/estimate-lines/'];
 function scoped(path){return cur.section&&(SCOPED.some(p=>path===p||path.startsWith(p+'?'))||SCOPED_PFX.some(p=>path.startsWith(p))||path.startsWith('/api/schemes/'))?path+(path.includes('?')?'&':'?')+'section='+encodeURIComponent(cur.section):path}
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const AUTH_MSG='Сессия входа (Cloudflare Access) истекла или ответ сервера не получен. Обновите страницу, войдите заново и повторите действие. Запись НЕ сохранена.';
@@ -13146,7 +14011,7 @@ let toastTimer;function toast(s,isErr){const t=document.getElementById('toast');
 function localDate(){const d=new Date();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')}
 function getActor(){try{if(typeof ME!=='undefined'&&ME&&ME.member&&ME.member.name)return ME.member.name}catch{}try{return localStorage.getItem('id_actor')||''}catch{return ''}}
 function setActor(v){try{localStorage.setItem('id_actor',v)}catch{}}
-async function load(){if(!cur.section)return;refreshTeam();loadGantt();try{[overviewData,elements]=await Promise.all([api('/api/overview'),api('/api/elements')]);renderMetrics();renderWork();renderSummary();fillBlocks();renderDashHead()}catch(e){toast(e.message,true)}}
+async function load(){if(!cur.section)return;refreshTeam();loadGantt();try{[overviewData,elements]=await Promise.all([api('/api/overview'),api('/api/elements')]);renderMetrics();renderWork();renderSummary();wzNoticeRender();fillBlocks();renderDashHead()}catch(e){toast(e.message,true)}}
 function renderDashHead(){const p=overviewData.project;document.getElementById('dashTitle').textContent=p.object_name;document.getElementById('dashSub').textContent='Раздел '+p.section_code+' · '+p.section_title+' · редакция '+p.revision;document.getElementById('dashTag').textContent=p.system||'—';if(overviewData.out_of_order)document.getElementById('dashSub').textContent+=' · ⚠ отметок вне очереди: '+overviewData.out_of_order;document.getElementById('workTag').textContent=p.section_code;const m=overviewData.missing_roles||[];const nd=overviewData.dxf_project?'':`<div class="notice"><b>Не загружен DXF проекта.</b> Без него программа не сможет сверить перечень с чертежом и подготовить схемы. <button class="btn small" onclick="showPage('files')">Загрузить</button></div>`;document.getElementById('dashNotice').innerHTML=nd+(m.length?`<div class="notice"><b>Не заполнены участники строительства (${m.length}):</b> ${m.map(esc).join('; ')}. Они нужны для шапок АОСР и журналов. <button class="btn small" onclick="openParticipants()">Заполнить</button></div>`:'')}
 async function init(){try{roles=await api('/api/roles');await refreshProjects()}catch(e){toast(e.message,true)}whatsNew()}
 async function whatsNew(){try{const d=await api('/api/whatsnew');if(!d.show)return;const m=document.getElementById('modal');m.innerHTML=`<div class="modal"><div class="dialog"><h2>Программа обновлена</h2><p class="sub" style="margin:0 0 10px">Установлена версия <b>${esc(d.version)}</b>. Что изменилось:</p>${d.releases.map(r=>`<div style="margin:10px 0"><b>Версия ${esc(r.version)}</b><ul style="margin:4px 0 0 18px;padding:0">${r.notes.map(n=>`<li style="margin:3px 0">${esc(n)}</li>`).join('')}</ul></div>`).join('')}<div class="dialogactions"><button class="btn primary" id="wnOk" onclick="whatsNewOk('${esc(d.version)}')">Ок</button></div></div></div>`;m.classList.remove('hidden')}catch(e){}}
@@ -13576,7 +14441,7 @@ const WZ2ST={done:'готово',work:'в работе',locked:'недоступ
 const WZ2STATE={proposed:'предложено',accepted:'принято',edited:'изменено',rejected:'отклонено'};
 async function wizLoad(){try{[WZ2,WZ]=await Promise.all([api('/api/wz2'),api('/api/wizard')])}catch(e){document.getElementById('wizSteps').innerHTML='<div class="empty">'+esc(e.message)+'</div>';return}
  if(!WZsel||WZ2.steps[WZsel-1].status==='locked')WZsel=WZ2.current;wizRender()}
-function wz2Cnt(s){const c=s.stats||{};if(s.n===1)return `объектов ${c.objects||0} · работ ${c.works||0}`+((c.object_rejected||0)+(c.work_rejected||0)?` · отклонено ${(c.object_rejected||0)+(c.work_rejected||0)}`:'');
+function wz2Cnt(s){const c=s.stats||{};if(s.n===1)return `объектов ${c.objects||0} · работ ${c.works||0}`+((c.object_rejected||0)+(c.work_rejected||0)?` · отклонено ${(c.object_rejected||0)+(c.work_rejected||0)}`:'')+(c.norms?` · нормативов ${c.norms}`:'')+(c.materials?` · материалов ${c.materials}`:'')+(c.remarks_open?` · замечаний ${c.remarks_open}`:'');
  if(s.n===2)return `групп ${c.groups||0} · объектов в группах ${c.members||0}`;const k=s.counters;if(s.n===3)return k?`работы ${k.works_ok}/${k.works} · объекты ${k.objects_ok}/${k.objects}`:'—';return k?`осталось: работ ${k.left_works} · объектов ${k.left_objects}`:'—'}
 function wizOpen(n){if(!WZ2||WZ2.steps[n-1].status==='locked')return;WZsel=n;wizRender()}
 function wizRender(){const W=WZ2;if(!W)return;
@@ -13590,25 +14455,60 @@ function wizRender(){const W=WZ2;if(!W)return;
 function wz2SubRender(){const box=document.getElementById('wz2SubBody');if(!box)return;const x=WZ2.steps[0].sub.find(y=>y.id===WZ2sub);
  const foot=`<div class="wact"><button class="btn small" onclick="wz2Confirm('${x.id}')">Подшаг выполнен</button>${x.phase!=='Ф0'?`<button class="btn small" onclick="wz2Confirm('${x.id}','skip')">Пропустить</button>`:''}</div>`;
  if(WZ2sub==='1.0'){const o=WZ&&WZ.steps[0]||{},c=o.counters||{},f=o.found||{};box.innerHTML=`<p class="sub" style="margin:0">Файлы раздела: основные — DXF чертежей и XML сметы. PDF и OCR — позже.</p><div class="wkv"><span><b>${c.project_files||0}</b>файлов проекта</span><span><b>${c.estimate_files||0}</b>смет</span>${f.at?`<span>найдено новых объектов: <b>${f.new_project}</b></span><span>чужие сети: ${esc(Object.entries(f.other_nets||{}).map(([k,v])=>k+' — '+v).join(', ')||'нет')}</span>`:''}</div><div class="wact"><button class="btn" onclick="wizAnalyze()">Проанализировать файлы</button><button class="btn" onclick="showPage('files')">Файлы проекта →</button></div>`+foot;return}
- if(WZ2sub!=='1.2'){box.innerHTML=`<div class="hintbox">Подшаг «${esc(x.title)}» появится в этапе ${x.phase}${x.id==='1.1'?' (библиотека нормативов НВК по умолчанию: СП 129.13330.2019, СП 31.13330.2021, СП 32.13330.2018, СП 8.13130.2020, ГОСТ 21.704-2011, ПП РФ №87)':x.id==='1.3'?' (ведомость материалов из DXF, сверка со сметой)':' (справка замечаний, трудоёмкость по ГЭСН или своим нормам)'}. Сейчас его можно пропустить — это не блокирует следующие шаги.</div>`+foot;return}
- box.innerHTML=`<div class="wact" style="margin:0 0 8px"><button class="btn small ${WZ2f.layer==='object'?'primary':''}" onclick="WZ2f.layer='object';wz2Items()">Объекты</button><button class="btn small ${WZ2f.layer==='work'?'primary':''}" onclick="WZ2f.layer='work';wz2Items()">Виды работ</button>
+ if(WZ2sub==='1.1'){box.innerHTML=`<p class="sub" style="margin:0">Нормативы раздела: библиотека по умолчанию (редактируется) и ссылки, найденные в надписях чертежей DXF. Принятые нормативы пойдут в АОСР и в проверки замечаний.</p><div class="wact" style="margin:8px 0"><button class="btn primary" onclick="wz2Fill('norms')">Заполнить: библиотека + DXF</button><button class="btn" onclick="wz2NormLib()">Библиотека нормативов…</button><button class="btn" onclick="wz2Journal(1,'layer:norm')">Откатить нормативы…</button></div>`+wz2TableShell()+foot;WZ2f.layer='norm';wz2Items();return}
+ if(WZ2sub==='1.3'){box.innerHTML=`<p class="sub" style="margin:0">Ведомость материалов проекта: трубы — по длинам участков перечня (тип и диаметр из описания), изделия колодцев — по типу колодца, плюс упоминания в DXF. Количество можно поправить — ручная правка не перезаписывается при повторном заполнении.</p><div class="wact" style="margin:8px 0"><button class="btn primary" onclick="wz2Fill('materials')">Заполнить ведомость</button><button class="btn" onclick="WZ2sub='1.4';wizRender()">Сверить со сметой →</button><button class="btn" onclick="wz2Journal(1,'layer:material')">Откатить материалы…</button></div>`+wz2TableShell()+foot;WZ2f.layer='material';wz2Items();return}
+ if(WZ2sub==='1.4'){box.innerHTML=`<p class="sub" style="margin:0">Замечания к проекту — справка для собственных нужд (не письмо). Сверка материалов проект–смета (вариант А): по ведомости 1.3, в единицах проекта, с учётом потерь; расхождение больше порога становится замечанием. Трудоёмкость — в чел.-ч по ГЭСН или по своей норме.</p><div class="wact" style="margin:8px 0"><button class="btn primary" onclick="wz2Compare(false)">Сверить материалы со сметой</button><button class="btn" onclick="wz2Params()">Порог и потери…</button><button class="btn" onclick="wz2RemarkEdit()">+ замечание</button><button class="btn" onclick="wz2Labor()">Нормы трудоёмкости…</button><a class="btn" href="${scoped('/api/wz2/remarks/export.csv')}" target="_blank">Справка (CSV для Google Таблиц)</a></div><div id="wz2Cmp"></div><h3 style="margin:14px 0 6px">Замечания</h3><div id="wz2Rem" class="loading">Загружаем…</div>`+foot;wz2Compare(true);wz2Remarks();return}
+ if(WZ2f.layer!=='object'&&WZ2f.layer!=='work')WZ2f.layer='object';box.innerHTML=`<div class="wact" style="margin:0 0 8px"><button class="btn small ${WZ2f.layer==='object'?'primary':''}" onclick="WZ2f.layer='object';wz2Items()">Объекты</button><button class="btn small ${WZ2f.layer==='work'?'primary':''}" onclick="WZ2f.layer='work';wz2Items()">Виды работ</button>
   <select class="wscope" onchange="WZ2f.state=this.value;wz2Items()"><option value="">все состояния</option>${Object.entries(WZ2STATE).map(([k,v])=>`<option value="${k}" ${WZ2f.state===k?'selected':''}>${v}</option>`).join('')}<option value="excluded" ${WZ2f.state==='excluded'?'selected':''}>не делаем / другой подрядчик</option></select>
   <input class="wscope" style="width:200px" placeholder="поиск: шифр, наименование" value="${esc(WZ2f.q)}" onchange="WZ2f.q=this.value;wz2Items()"><button class="btn small" onclick="wz2Add()">+ ${WZ2f.layer==='object'?'объект':'вид работ'}</button></div>
   <div class="wact" id="wz2Bulk" style="margin:0 0 8px"></div><div class="tablewrap" style="max-height:55vh;overflow:auto"><table class="table" style="min-width:860px"><thead id="wz2Head"></thead><tbody id="wz2Body"><tr><td class="loading">Загружаем…</td></tr></tbody></table></div>`+foot;wz2Items()}
+function wz2TableShell(){return `<div class="wact" style="margin:0 0 8px"><select class="wscope" onchange="WZ2f.state=this.value;wz2Items()"><option value="">все состояния</option>${Object.entries(WZ2STATE).map(([k,v])=>`<option value="${k}" ${WZ2f.state===k?'selected':''}>${v}</option>`).join('')}</select><input class="wscope" style="width:200px" placeholder="поиск" value="${esc(WZ2f.q)}" onchange="WZ2f.q=this.value;wz2Items()"><button class="btn small" onclick="wz2Add()">+ вручную</button></div><div class="wact" id="wz2Bulk" style="margin:0 0 8px"></div><div class="tablewrap" style="max-height:55vh;overflow:auto"><table class="table" style="min-width:860px"><thead id="wz2Head"></thead><tbody id="wz2Body"><tr><td class="loading">Загружаем…</td></tr></tbody></table></div>`}
+async function wz2Fill(what){try{const r=await api('/api/wz2/'+what+'/fill',{method:'POST'});toast(r.message);await Promise.all([wz2Items(),wz2Refresh()])}catch(e){toast(e.message,true)}}
+function wz2Num(x){return x==null?'—':(+x).toLocaleString('ru-RU',{maximumFractionDigits:3})}
+let WZ2cmp=null;
+async function wz2Compare(dry){const box=document.getElementById('wz2Cmp');try{const r=await api('/api/wz2/materials/compare?dry_run='+(dry?'true':'false'),{method:'POST'});WZ2cmp=r;if(!dry){toast(r.message);wz2Remarks();wz2Refresh()}
+ const cls={ok:'done',over:'work',under:'work',project_only:'locked',estimate_only:'locked',unit:'stale'};
+ box.innerHTML=r.rows.length?`<div class="kind" style="margin-bottom:6px">Порог ${r.threshold_pct} %, потери: ${esc(Object.entries(r.losses).map(([k,v])=>k+' '+v+' %').join(', '))}. ${esc(r.message)}${r.unrecognized.length?` · позиций-материалов сметы без сверки (нет количества в проекте): ${r.unrecognized.length}`:''}</div><div class="tablewrap" style="max-height:40vh;overflow:auto"><table class="table" style="min-width:860px"><thead><tr><th>Материал</th><th>Проект</th><th>Потери</th><th>Нужно</th><th>Смета</th><th>Разница</th><th>Итог</th><th>Позиции сметы</th></tr></thead><tbody>${r.rows.map(x=>`<tr><td>${esc(x.name)}</td><td>${wz2Num(x.project)} ${esc(x.unit)}</td><td class="kind">${x.loss_pct?x.loss_pct+' %':''}</td><td>${wz2Num(x.need)}</td><td>${wz2Num(x.estimate)}</td><td>${x.diff==null?'':wz2Num(x.diff)+(x.pct!=null?` <span class="kind">(${x.pct>0?'+':''}${x.pct} %)</span>`:'')}</td><td><span class="wbd ${cls[x.status]||''}">${esc(r.statuses[x.status]||x.status)}</span></td><td class="kind">${x.rows.map(w=>'п.'+esc(w.n)+' '+esc(w.name.slice(0,50))+' — '+wz2Num(w.qty)+' '+esc(w.unit)).join('<br>')}</td></tr>`).join('')}</tbody></table></div>${dry?'<div class="kind">Это предварительный результат. Нажмите «Сверить материалы со сметой» — расхождения станут замечаниями.</div>':''}`:'<div class="hintbox">Нет данных для сверки: заполните ведомость материалов (1.3) и загрузите смету раздела.</div>'}catch(e){box.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}
+let WZ2rem=null;
+async function wz2Remarks(){const box=document.getElementById('wz2Rem');if(!box)return;try{WZ2rem=await api('/api/wz2/remarks');const R=WZ2rem.remarks,t=WZ2rem.totals;
+ box.className='';box.innerHTML=`<div class="kind" style="margin-bottom:6px">Всего ${t.count}, открыто ${t.open}, Σ трудоёмкость (кроме снятых) ${wz2Num(t.labor_hours)} чел.-ч</div><div class="tablewrap" style="max-height:50vh;overflow:auto"><table class="table" style="min-width:900px"><thead><tr><th>№</th><th>Тип</th><th>Описание</th><th>Влияние</th><th>Чел.-ч</th><th>Статус</th><th></th></tr></thead><tbody>${R.map(x=>`<tr class="${x.status==='dropped'?'wsx':''}"><td class="code">${esc(x.code)}</td><td class="kind">${esc(x.type_label)}<div>${x.origin==='auto'?'автопроверка':'вручную'}</div></td><td>${esc(x.text)}${x.decision?`<div class="kind">Решение: ${esc(x.decision)}</div>`:''}</td><td class="kind">${esc([x.impact_qty,x.impact_mat].filter(Boolean).join('; '))}</td><td>${x.labor_hours!=null?wz2Num(x.labor_hours):''}<div class="kind">${esc(x.labor_basis||'')}</div></td><td><span class="wbd ${x.status==='open'?'work':x.status==='dropped'?'locked':x.status==='accepted'?'done':'stale'}">${esc(x.status_label)}</span></td><td class="ws"><button class="btn small" onclick="wz2RemarkEdit('${x.id}')">Изменить</button></td></tr>`).join('')||'<tr><td colspan="7" class="empty">Замечаний нет</td></tr>'}</tbody></table></div>`}catch(e){box.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}
+function wz2RemarkEdit(id){const x=id?(WZ2rem&&WZ2rem.remarks.find(r=>r.id===id)):{type:'other',status:'open',text:'',quote:'',source:'',impact_qty:'',impact_mat:'',labor_code:'',labor_qty:null,decision:''};if(!x)return;const T=(WZ2rem&&WZ2rem.types)||{},S=(WZ2rem&&WZ2rem.statuses)||{};
+ openModal(`<h2>${id?'Замечание '+esc(x.code):'Новое замечание'}</h2><div class="pgrid"><div class="field"><label>Тип</label><select id="rmType">${Object.entries(T).map(([k,v])=>`<option value="${k}" ${k===x.type?'selected':''}>${esc(v)}</option>`).join('')}</select></div><div class="field"><label>Статус</label><select id="rmSt">${Object.entries(S).map(([k,v])=>`<option value="${k}" ${k===x.status?'selected':''}>${esc(v)}</option>`).join('')}</select></div></div><div class="field"><label>Описание</label><textarea id="rmText">${esc(x.text)}</textarea></div><div class="field"><label>Цитата из проекта</label><input id="rmQuote" value="${esc(x.quote||'')}"></div><div class="field"><label>Источник (файл, лист)</label><input id="rmSrc" value="${esc(x.source||'')}"></div><div class="pgrid"><div class="field"><label>Влияние на объём</label><input id="rmIq" value="${esc(x.impact_qty||'')}" placeholder="+24 м траншеи"></div><div class="field"><label>Влияние на материалы</label><input id="rmIm" value="${esc(x.impact_mat||'')}"></div></div>
+ <div class="pgrid"><div class="field"><label>Шифр нормы (ГЭСН или своя)</label><input id="rmLc" value="${esc(x.labor_code||'')}" placeholder="23-01-033-03"></div><div class="field"><label>Объём для трудоёмкости</label><input id="rmLq" type="number" step="any" value="${x.labor_qty??''}"></div><div class="field"><label>Ед. объёма</label><input id="rmLu" placeholder="м, м3, шт (пусто — как в норме)"></div></div><div class="kind" id="rmLb">${esc(x.labor_basis||'')}${x.labor_hours!=null?' → '+wz2Num(x.labor_hours)+' чел.-ч':''}</div><div class="field"><label>Решение</label><textarea id="rmDec">${esc(x.decision||'')}</textarea></div><div class="dialogactions"><button class="btn" onclick="closeModal()">Отмена</button><button class="btn primary" onclick="wz2RemarkSave('${id||''}')">Сохранить</button></div>`)}
+async function wz2RemarkSave(id){const g=k=>document.getElementById(k).value;const b={type:g('rmType'),status:g('rmSt'),text:g('rmText'),quote:g('rmQuote'),source:g('rmSrc'),impact_qty:g('rmIq'),impact_mat:g('rmIm'),decision:g('rmDec')};
+ if(g('rmLc').trim()&&g('rmLq')!==''){b.labor_code=g('rmLc').trim();b.labor_qty=+g('rmLq');if(g('rmLu').trim())b.labor_unit=g('rmLu').trim()}
+ try{const r=await api('/api/wz2/remarks'+(id?'/'+encodeURIComponent(id):''),{method:id?'PUT':'POST',body:JSON.stringify(b)});closeModal();toast(r.message);wz2Remarks();wz2Refresh()}catch(e){toast(e.message,true)}}
+async function wz2Params(){try{const p=await api('/api/wz2/params');openModal(`<h2>Сверка материалов: порог и потери</h2><div class="field"><label>Порог расхождения, %</label><input id="prThr" type="number" step="any" value="${p.threshold_pct}"></div><p class="sub" style="margin:0 0 6px">Нормативные потери по видам материалов, % (добавляются к количеству по проекту перед сравнением со сметой):</p>${Object.entries(p.losses).map(([k,v])=>`<div class="field"><label>${esc(k)}</label><input class="prLoss" data-k="${esc(k)}" type="number" step="any" value="${v}"></div>`).join('')}<div class="dialogactions"><button class="btn" onclick="closeModal()">Отмена</button><button class="btn primary" onclick="wz2ParamsSave()">Сохранить</button></div>`)}catch(e){toast(e.message,true)}}
+async function wz2ParamsSave(){const losses={};document.querySelectorAll('.prLoss').forEach(i=>losses[i.dataset.k]=+i.value||0);try{const r=await api('/api/wz2/params',{method:'PUT',body:JSON.stringify({threshold_pct:+document.getElementById('prThr').value,losses})});closeModal();toast(r.message);wz2Compare(true)}catch(e){toast(e.message,true)}}
+async function wz2NormLib(){try{const d=await api('/api/wz2/normlib');openModal(`<div class="wz2wide"><h2>Библиотека нормативов (по умолчанию для разделов)</h2><div class="tablewrap" style="max-height:50vh;overflow:auto"><table class="table" style="min-width:700px"><thead><tr><th>Обозначение</th><th>Наименование</th><th>Ссылка</th><th>Вкл.</th><th></th></tr></thead><tbody>${d.library.map(l=>`<tr><td class="code">${esc(l.designation)}</td><td>${esc(l.title)}</td><td class="kind">${l.url?`<a href="${esc(l.url)}" target="_blank">открыть</a>`:''}</td><td>${l.active?'да':'нет'}</td><td class="ws"><button class="btn small" onclick='wz2NormLibEdit(${JSON.stringify(l).replace(/'/g,"&#39;")})'>Изменить</button></td></tr>`).join('')}</tbody></table></div><div class="dialogactions"><button class="btn" onclick="wz2NormLibEdit(null)">+ документ</button><button class="btn" onclick="closeModal()">Закрыть</button></div></div>`)}catch(e){toast(e.message,true)}}
+function wz2NormLibEdit(l){l=l||{designation:'',title:'',url:'',nets:'НВК',applies:'',active:1};openModal(`<h2>${l.id?'Документ библиотеки':'Новый документ'}</h2><div class="field"><label>Обозначение</label><input id="nlD" value="${esc(l.designation)}" placeholder="СП 129.13330.2019"></div><div class="field"><label>Наименование</label><input id="nlT" value="${esc(l.title)}"></div><div class="field"><label>Ссылка</label><input id="nlU" value="${esc(l.url)}"></div><div class="field"><label>Применимость</label><input id="nlA" value="${esc(l.applies||'')}" placeholder="трубы ПЭ, испытания…"></div><label class="checkrow"><input type="checkbox" id="nlOn" ${l.active?'checked':''}> подставлять в разделы</label><div class="dialogactions">${l.id?`<button class="btn" onclick="wz2NormLibDel('${l.id}')">Удалить</button>`:''}<button class="btn" onclick="wz2NormLib()">Назад</button><button class="btn primary" onclick="wz2NormLibSave('${l.id||''}')">Сохранить</button></div>`)}
+async function wz2NormLibSave(id){const g=k=>document.getElementById(k).value;try{const r=await api('/api/wz2/normlib'+(id?'/'+id:''),{method:id?'PUT':'POST',body:JSON.stringify({designation:g('nlD'),title:g('nlT'),url:g('nlU'),applies:g('nlA'),nets:'НВК',active:document.getElementById('nlOn').checked})});toast(r.message);wz2NormLib()}catch(e){toast(e.message,true)}}
+async function wz2NormLibDel(id){if(!confirm('Удалить документ из библиотеки?'))return;try{const r=await api('/api/wz2/normlib/'+id,{method:'DELETE'});toast(r.message);wz2NormLib()}catch(e){toast(e.message,true)}}
+let WZ2lab=null;
+async function wz2Labor(q){try{WZ2lab=await api('/api/labor-norms?'+new URLSearchParams({q:q||''}));const d=WZ2lab;openModal(`<div class="wz2wide"><h2>Нормы трудоёмкости (чел.-ч)</h2><p class="sub" style="margin:0 0 8px">ГЭСН — затраты труда рабочих из индекса норм (загружено норм ГЭСН: ${d.gesn_loaded}). Норму можно исправить — тогда при обновлении из ГЭСН она не перезапишется — или добавить свою (например, для своих расценок ИТС-…).</p><div class="wact" style="margin:0 0 8px"><input class="wscope" id="lbQ" style="width:240px" placeholder="шифр или наименование" value="${esc(q||'')}" onchange="wz2Labor(this.value)"><button class="btn small" onclick="wz2LaborSeed()">Заполнить / обновить из ГЭСН</button><button class="btn small" onclick="wz2LaborEdit(null)">+ своя норма</button><span class="kind" style="align-self:center">в таблице: ${d.total}${d.norms.length<d.total?', показано '+d.norms.length:''}</span></div><div class="tablewrap" style="max-height:55vh;overflow:auto"><table class="table" style="min-width:760px"><thead><tr><th>Шифр</th><th>Наименование</th><th>Ед.</th><th>Чел.-ч на ед.</th><th>Источник</th><th></th></tr></thead><tbody>${d.norms.map(n=>`<tr><td class="code">${esc(n.code)}</td><td>${esc(n.name)}</td><td>${esc(n.unit)}</td><td><b>${wz2Num(n.hours)}</b>${n.edited&&n.gesn_hours!=null?`<div class="kind">ГЭСН: ${wz2Num(n.gesn_hours)}</div>`:''}</td><td class="kind">${esc(n.source)}${n.edited?' (исправлена)':''}</td><td class="ws"><button class="btn small" onclick="wz2LaborEdit('${n.id}')">Изменить</button></td></tr>`).join('')||'<tr><td colspan="6" class="empty">Норм нет — нажмите «Заполнить из ГЭСН» или добавьте свою</td></tr>'}</tbody></table></div><div class="dialogactions"><button class="btn" onclick="closeModal()">Закрыть</button></div></div>`)}catch(e){toast(e.message,true)}}
+async function wz2LaborSeed(){try{const r=await api('/api/labor-norms/seed',{method:'POST'});toast(r.message);wz2Labor(document.getElementById('lbQ')?.value||'')}catch(e){toast(e.message,true)}}
+function wz2LaborEdit(id){const n=id?WZ2lab.norms.find(x=>x.id===id):{code:'',name:'',unit:'',hours:0,note:''};openModal(`<h2>${id?'Норма '+esc(n.code):'Своя норма'}</h2><div class="field"><label>Шифр</label><input id="lbC" value="${esc(n.code)}" placeholder="ИТС-1-1 или код работы"></div><div class="field"><label>Наименование</label><input id="lbN" value="${esc(n.name)}"></div><div class="pgrid"><div class="field"><label>Единица нормы</label><input id="lbU" value="${esc(n.unit)}" placeholder="100 м, м3, шт"></div><div class="field"><label>Чел.-ч на единицу</label><input id="lbH" type="number" step="any" value="${n.hours}"></div></div><div class="field"><label>Комментарий</label><input id="lbNote" value="${esc(n.note||'')}"></div><div class="dialogactions">${id?`<button class="btn" onclick="wz2LaborDel('${id}')">Удалить</button>`:''}<button class="btn" onclick="wz2Labor()">Назад</button><button class="btn primary" onclick="wz2LaborSave('${id||''}')">Сохранить</button></div>`)}
+async function wz2LaborSave(id){const g=k=>document.getElementById(k).value;try{const r=await api('/api/labor-norms'+(id?'/'+id:''),{method:id?'PUT':'POST',body:JSON.stringify({code:g('lbC'),name:g('lbN'),unit:g('lbU'),hours:+g('lbH')||0,note:g('lbNote')})});toast(r.message);wz2Labor()}catch(e){toast(e.message,true)}}
+async function wz2LaborDel(id){if(!confirm('Удалить норму?'))return;try{const r=await api('/api/labor-norms/'+id,{method:'DELETE'});toast(r.message);wz2Labor()}catch(e){toast(e.message,true)}}
+function wzNoticeRender(){const N=(overviewData&&overviewData.wz_notices)||[];document.querySelectorAll('.wzNotice').forEach(el=>{el.innerHTML=N.map(n=>`<div class="notice" style="background:#fff4d6;border-color:#e0b44c"><b>${esc(n.title)}</b> <span class="kind">${esc(fmtDT(n.at))} · ${esc(n.by)}</span><div>${esc(n.text)}</div><button class="btn small" style="margin-top:6px" onclick="wzNoticeSeen('${n.id}')">Понятно</button></div>`).join('')})}
+async function wzNoticeSeen(id){try{await api('/api/wz2/notices/'+encodeURIComponent(id)+'/seen',{method:'POST'});overviewData.wz_notices=(overviewData.wz_notices||[]).filter(n=>n.id!==id);wzNoticeRender()}catch(e){toast(e.message,true)}}
 async function wz2Items(){const qs=new URLSearchParams({layer:WZ2f.layer,state:WZ2f.state,q:WZ2f.q,group:WZ2f.group});try{const d=await api('/api/wz2/items?'+qs.toString());WZ2it=d.items;WZ2sel=new Set([...WZ2sel].filter(i=>WZ2it.some(x=>x.id===i)));wz2ItemsRender()}catch(e){toast(e.message,true)}}
 function wz2BulkRender(){const n=WZ2sel.size,el=document.getElementById('wz2Bulk');if(!el)return;const gs=(WZ2g&&WZ2g.groups)||[];
- el.innerHTML=n?`<b style="align-self:center">Выделено: ${n}</b><button class="btn small" onclick="wz2BulkDo({state:'accepted'})">Принять</button><button class="btn small" onclick="wz2BulkDo({state:'rejected'})">Отклонить</button><button class="btn small" onclick="wz2BulkDo({scope:''})">Наша работа</button><button class="btn small" onclick="wz2BulkDo({scope:'excluded'})">Не делаем</button><button class="btn small" onclick="wz2BulkDo({scope:'other'})">Другой подрядчик</button>${gs.length?`<select class="wscope" onchange="if(this.value)wz2BulkDo({group_id:this.value==='-'?'':this.value})"><option value="">в группу…</option>${gs.map(g=>`<option value="${g.id}">${esc(g.name)}</option>`).join('')}<option value="-">— без группы</option></select>`:''}<button class="btn small" onclick="wz2Journal(WZsel,'items')">Откатить выделенные…</button><button class="btn small" onclick="WZ2sel.clear();wz2ItemsRender()">Снять выделение</button>`:`<span class="kind">Отметьте строки галочкой — появятся массовые действия. Показано: ${WZ2it.length}</span>`}
-function wz2ItemsRender(){const tb=document.getElementById('wz2Body');if(!tb)return;const isW=WZ2f.layer==='work';const gname={};((WZ2g&&WZ2g.groups)||[]).forEach(g=>gname[g.id]=g.name);
+ const NM=WZ2f.layer==='norm'||WZ2f.layer==='material';el.innerHTML=n?`<b style="align-self:center">Выделено: ${n}</b><button class="btn small" onclick="wz2BulkDo({state:'accepted'})">Принять</button><button class="btn small" onclick="wz2BulkDo({state:'rejected'})">Отклонить</button>${NM?'':`<button class="btn small" onclick="wz2BulkDo({scope:''})">Наша работа</button><button class="btn small" onclick="wz2BulkDo({scope:'excluded'})">Не делаем</button><button class="btn small" onclick="wz2BulkDo({scope:'other'})">Другой подрядчик</button>`}${gs.length&&!NM?`<select class="wscope" onchange="if(this.value)wz2BulkDo({group_id:this.value==='-'?'':this.value})"><option value="">в группу…</option>${gs.map(g=>`<option value="${g.id}">${esc(g.name)}</option>`).join('')}<option value="-">— без группы</option></select>`:''}<button class="btn small" onclick="wz2Journal(WZsel,'items')">Откатить выделенные…</button><button class="btn small" onclick="WZ2sel.clear();wz2ItemsRender()">Снять выделение</button>`:`<span class="kind">Отметьте строки галочкой — появятся массовые действия. Показано: ${WZ2it.length}</span>`}
+function wz2ItemsRender(){const tb=document.getElementById('wz2Body');if(!tb)return;if(WZ2f.layer==='norm'||WZ2f.layer==='material')return wz2ItemsRender2();const isW=WZ2f.layer==='work';const gname={};((WZ2g&&WZ2g.groups)||[]).forEach(g=>gname[g.id]=g.name);
  document.getElementById('wz2Head').innerHTML=`<tr><th style="width:28px"><input type="checkbox" onclick="wz2SelAll(this.checked)" ${WZ2it.length&&WZ2it.every(x=>WZ2sel.has(x.id))?'checked':''}></th><th>${isW?'Объект':'Шифр'}</th><th>Наименование</th><th>${isW?'Код':'Вид'}</th><th>Группа</th><th>Объём</th><th>Состояние</th><th>Отметки</th><th></th></tr>`;
  const L=WZ2it.slice(0,400);tb.innerHTML=L.map(r=>`<tr class="${r.state==='rejected'||r.scope?'wsx':''}"><td class="ws"><input type="checkbox" ${WZ2sel.has(r.id)?'checked':''} onclick="wz2Sel('${r.id}',this.checked)"></td><td class="code">${esc(isW?r.parent_key:r.key)}</td><td>${esc(r.name)}${r.note?`<div class="kind">${esc(r.note.slice(0,120))}</div>`:''}</td><td class="kind">${esc(r.kind)}</td><td class="kind">${esc(gname[r.group_id]||'')}</td><td>${r.qty!=null?esc(r.qty)+' '+esc(r.unit):''}</td><td class="ws"><span class="wbd ${r.state==='rejected'?'locked':r.state==='accepted'?'done':'work'}">${WZ2STATE[r.state]||r.state}</span>${r.scope?`<div class="kind">${esc(WZ2.scopes[r.scope])}</div>`:''}<div class="kind">${r.origin==='legacy'?'из прежнего перечня':r.origin==='manual'?'вручную':'из проекта'}</div></td><td class="ws">${r.marks?`<b style="color:#9b6200">${r.marks}</b>`:''}</td><td class="ws"><button class="btn small" onclick="wz2Edit('${r.id}')">Изменить</button></td></tr>`).join('')+(WZ2it.length>400?`<tr><td colspan="9" class="kind">Показаны первые 400 из ${WZ2it.length} — уточните фильтр</td></tr>`:'')||'<tr><td colspan="9" class="empty">Нет пунктов</td></tr>';wz2BulkRender()}
+function wz2ItemsRender2(){const tb=document.getElementById('wz2Body');const isN=WZ2f.layer==='norm';
+ document.getElementById('wz2Head').innerHTML=`<tr><th style="width:28px"><input type="checkbox" onclick="wz2SelAll(this.checked)" ${WZ2it.length&&WZ2it.every(x=>WZ2sel.has(x.id))?'checked':''}></th><th>${isN?'Обозначение':'Материал'}</th><th>${isN?'Наименование / где найдено':'Как посчитано'}</th><th>${isN?'Источник':'Количество'}</th><th>Состояние</th><th></th></tr>`;
+ const L=WZ2it.slice(0,400);tb.innerHTML=L.map(r=>{let d={};try{d=JSON.parse(r.data_json||'{}')}catch{}return `<tr class="${r.state==='rejected'?'wsx':''}"><td class="ws"><input type="checkbox" ${WZ2sel.has(r.id)?'checked':''} onclick="wz2Sel('${r.id}',this.checked)"></td><td class="code">${esc(isN?r.key:r.name)}</td><td>${isN?esc(r.name!==r.key?r.name:'')+(r.locator?`<div class="kind">${esc(r.locator)}</div>`:'')+(d.quotes&&d.quotes.length?`<div class="kind">«${esc(d.quotes[0].slice(0,120))}»</div>`:'')+(d.url?`<div class="kind"><a href="${esc(d.url)}" target="_blank">текст документа</a></div>`:''):`<span class="kind">${esc(r.note)}</span>`+(d.computed_qty!=null&&r.state==='edited'&&d.computed_qty!==r.qty?`<div class="kind">по перечню: ${wz2Num(d.computed_qty)}</div>`:'')}</td><td>${isN?esc(r.kind)+(d.count?` <span class="kind">×${d.count}</span>`:''):(r.qty!=null?'<b>'+wz2Num(r.qty)+'</b> '+esc(r.unit):'<span class="kind">не определено</span>')}</td><td class="ws"><span class="wbd ${r.state==='rejected'?'locked':r.state==='accepted'?'done':'work'}">${WZ2STATE[r.state]||r.state}</span><div class="kind">${r.origin==='library'?'библиотека':r.origin==='manual'?'вручную':'автоматически'}</div></td><td class="ws"><button class="btn small" onclick="wz2Edit('${r.id}')">Изменить</button></td></tr>`}).join('')+(WZ2it.length>400?`<tr><td colspan="6" class="kind">Показаны первые 400 из ${WZ2it.length}</td></tr>`:'')||`<tr><td colspan="6" class="empty">${isN?'Нормативов нет — нажмите «Заполнить: библиотека + DXF»':'Материалов нет — нажмите «Заполнить ведомость»'}</td></tr>`;wz2BulkRender()}
 function wz2Sel(id,on){on?WZ2sel.add(id):WZ2sel.delete(id);wz2BulkRender()}
 function wz2SelAll(on){WZ2it.slice(0,400).forEach(r=>on?WZ2sel.add(r.id):WZ2sel.delete(r.id));wz2ItemsRender()}
 async function wz2BulkDo(b){try{const r=await api('/api/wz2/items/bulk',{method:'POST',body:JSON.stringify({ids:[...WZ2sel],...b})});toast(r.message);await Promise.all([wz2Items(),wz2Refresh()])}catch(e){toast(e.message,true)}}
 async function wz2Refresh(){try{WZ2=await api('/api/wz2');const keep=WZsel;const sub=document.getElementById('wz2SubBody');document.querySelectorAll('#wizSteps .wst').forEach((el,i)=>{const s=WZ2.steps[i];el.querySelector('.wbd').className='wbd '+s.status;el.querySelector('.wbd').textContent=(WZ2ST[s.status]||s.status)+(s.note?' · '+s.note:'');el.querySelector('.wc').textContent=wz2Cnt(s)})}catch(e){}}
-function wz2Edit(id){const r=WZ2it.find(x=>x.id===id);if(!r)return;openModal(`<h2>${r.layer==='object'?'Объект':'Вид работ'} ${esc(r.layer==='work'?r.parent_key:r.key)}</h2>${r.layer==='object'?`<div class="field"><label>Шифр</label><input id="w2Key" value="${esc(r.key)}"></div>`:''}<div class="field"><label>Наименование</label><input id="w2Name" value="${esc(r.name)}"></div><div class="field"><label>${r.layer==='object'?'Вид объекта':'Код работы'}</label><input id="w2Kind" value="${esc(r.kind)}"></div><div class="pgrid"><div class="field"><label>Объём</label><input id="w2Qty" type="number" step="any" value="${r.qty??''}"></div><div class="field"><label>Ед.</label><input id="w2Unit" value="${esc(r.unit)}"></div></div><div class="field"><label>Статус объёма</label><select id="w2Scope">${Object.entries(WZ2.scopes).map(([k,v])=>`<option value="${k}" ${k===(r.scope||'')?'selected':''}>${esc(v)}</option>`).join('')}</select></div><div class="field"><label>Примечание</label><textarea id="w2Note">${esc(r.note)}</textarea></div>${r.marks?`<div class="notice">У пункта ${r.marks} отметок прораба — они сохранятся в истории.</div>`:''}<div class="dialogactions"><button class="btn" onclick="wz2HistItem('${r.id}')">История</button><button class="btn" onclick="closeModal()">Отмена</button><button class="btn primary" onclick="wz2EditSave('${r.id}','${r.layer}')">Сохранить</button></div>`)}
+function wz2Edit(id){const r=WZ2it.find(x=>x.id===id);if(!r)return;openModal(`<h2>${({object:'Объект',work:'Вид работ',norm:'Норматив',material:'Материал'})[r.layer]||''} ${esc(r.layer==='work'?r.parent_key:r.key)}</h2>${r.layer==='object'||r.layer==='norm'?`<div class="field"><label>Шифр</label><input id="w2Key" value="${esc(r.key)}"></div>`:''}<div class="field"><label>Наименование</label><input id="w2Name" value="${esc(r.name)}"></div><div class="field"><label>${({object:'Вид объекта',work:'Код работы',norm:'Источник / применимость',material:'Вид материала'})[r.layer]||'Вид'}</label><input id="w2Kind" value="${esc(r.kind)}"></div><div class="pgrid"><div class="field"><label>Объём</label><input id="w2Qty" type="number" step="any" value="${r.qty??''}"></div><div class="field"><label>Ед.</label><input id="w2Unit" value="${esc(r.unit)}"></div></div><div class="field"><label>Статус объёма</label><select id="w2Scope">${Object.entries(WZ2.scopes).map(([k,v])=>`<option value="${k}" ${k===(r.scope||'')?'selected':''}>${esc(v)}</option>`).join('')}</select></div><div class="field"><label>Примечание</label><textarea id="w2Note">${esc(r.note)}</textarea></div>${r.marks?`<div class="notice">У пункта ${r.marks} отметок прораба — они сохранятся в истории.</div>`:''}<div class="dialogactions"><button class="btn" onclick="wz2HistItem('${r.id}')">История</button><button class="btn" onclick="closeModal()">Отмена</button><button class="btn primary" onclick="wz2EditSave('${r.id}','${r.layer}')">Сохранить</button></div>`)}
 async function wz2EditSave(id,layer){const g=k=>document.getElementById(k);const b={name:g('w2Name').value,kind:g('w2Kind').value,unit:g('w2Unit').value,note:g('w2Note').value,scope:g('w2Scope').value,layer};if(g('w2Key'))b.key=g('w2Key').value;if(g('w2Qty').value!=='')b.qty=+g('w2Qty').value;try{const r=await api('/api/wz2/items/'+encodeURIComponent(id),{method:'PUT',body:JSON.stringify(b)});closeModal();toast(r.message);await Promise.all([wz2Items(),wz2Refresh()])}catch(e){toast(e.message,true)}}
-function wz2Add(){const isW=WZ2f.layer==='work';openModal(`<h2>${isW?'Новый вид работ':'Новый объект'}</h2>${isW?`<div class="field"><label>Объект (шифр)</label><input id="w2Par" placeholder="К2-10"></div>`:''}<div class="field"><label>${isW?'Код работы (латиницей, напр. pit)':'Шифр'}</label><input id="w2Key"></div><div class="field"><label>Наименование</label><input id="w2Name"></div><div class="field"><label>${isW?'Код (как в перечне)':'Вид объекта'}</label><input id="w2Kind"></div><div class="dialogactions"><button class="btn" onclick="closeModal()">Отмена</button><button class="btn primary" onclick="wz2AddSave()">Добавить</button></div>`)}
-async function wz2AddSave(){const g=k=>document.getElementById(k)?.value||'';const isW=WZ2f.layer==='work';const b={layer:WZ2f.layer,key:g('w2Key'),name:g('w2Name'),kind:g('w2Kind')||(isW?g('w2Key'):'')};
+function wz2Add(){const isW=WZ2f.layer==='work';const NM={norm:'Новый норматив',material:'Новый материал'}[WZ2f.layer];openModal(`<h2>${NM||(isW?'Новый вид работ':'Новый объект')}</h2>${isW?`<div class="field"><label>Объект (шифр)</label><input id="w2Par" placeholder="К2-10"></div>`:''}<div class="field"><label>${isW?'Код работы (латиницей, напр. pit)':'Шифр'}</label><input id="w2Key"></div><div class="field"><label>Наименование</label><input id="w2Name"></div><div class="field"><label>${isW?'Код (как в перечне)':'Вид объекта'}</label><input id="w2Kind"></div><div class="dialogactions"><button class="btn" onclick="closeModal()">Отмена</button><button class="btn primary" onclick="wz2AddSave()">Добавить</button></div>`)}
+async function wz2AddSave(){const g=k=>document.getElementById(k)?.value||'';const isW=WZ2f.layer==='work';const b={layer:WZ2f.layer,key:g('w2Key'),name:g('w2Name')||g('w2Key'),kind:g('w2Kind')||(isW?g('w2Key'):'')};
  try{if(isW){const d=await api('/api/wz2/items?'+new URLSearchParams({layer:'object',q:g('w2Par')}));const o=d.items.find(x=>x.key===g('w2Par').trim());if(!o)throw Error('Объект '+g('w2Par')+' не найден');b.parent_id=o.id}
  const r=await api('/api/wz2/items',{method:'POST',body:JSON.stringify(b)});closeModal();toast(r.message);await Promise.all([wz2Items(),wz2Refresh()])}catch(e){toast(e.message,true)}}
 async function wz2GroupsLoad(){try{WZ2g=await api('/api/wz2/groups')}catch(e){toast(e.message,true);return}const box=document.getElementById('wz2Groups');if(!box)return;
@@ -13619,13 +14519,13 @@ async function wz2GroupNew(){const n=prompt('Название группы (на
 async function wz2GroupRen(id){const g=WZ2g.groups.find(x=>x.id===id);const n=prompt('Новое название',g.name);if(!n)return;try{await api('/api/wz2/groups/'+id,{method:'PUT',body:JSON.stringify({name:n,kind:g.kind,parent_id:g.parent_id,note:g.note})});await Promise.all([wz2GroupsLoad(),wz2Refresh()])}catch(e){toast(e.message,true)}}
 async function wz2GroupDel(id){if(!confirm('Удалить группу? Объекты останутся, но без группы.'))return;try{const r=await api('/api/wz2/groups/'+id,{method:'DELETE'});toast(r.message);if(WZ2f.group===id)WZ2f.group='';await Promise.all([wz2GroupsLoad(),wz2Refresh()])}catch(e){toast(e.message,true)}}
 async function wz2Confirm(step,action){try{const r=await api('/api/wz2/confirm',{method:'POST',body:JSON.stringify({step,action:action||'done'})});WZ2=r.state;const p=r.published||{};const n=Object.values(p).reduce((a,b)=>a+b,0);toast(step.includes('.')?'Подшаг отмечен':'Шаг '+step+' подтверждён'+(n?'; в перечне изменено: '+Object.entries(p).map(([k,v])=>({el_added:'добавлено объектов',el_changed:'изменено объектов',el_disabled:'выведено из перечня',op_added:'добавлено работ',op_changed:'изменено работ',op_removed:'удалено работ',op_kept_marked:'оставлено работ с отметками'}[k]||k)+' '+v).join(', '):'; перечень без изменений'));await wizLoad();load()}catch(e){toast(e.message,true)}}
-function wz2Journal(step,mode){const S=WZ2.snapshots.filter(x=>!step||x.step===step);const kindRu={migration:'миграция',confirm:'подтверждение','before-rollback':'перед откатом'};
+function wz2Journal(step,mode){const S=WZ2.snapshots.filter(x=>!step||x.step===step);const kindRu={migration:'миграция',confirm:'подтверждение','before-rollback':'перед откатом','before-auto':'перед автосопоставлением'};
  openModal(`<div class="wz2wide"><h2>Снимки${step?' шага '+step:''} и откат</h2><p class="sub" style="margin:0 0 10px">Снимок сохраняется при каждом подтверждении и перед каждым откатом — откат тоже можно отменить. ${mode==='items'?`<b>Частичный откат: выделено ${WZ2sel.size} пунктов.</b>`:WZ2f.group&&step===2?'':''}</p>
- <div class="field"><label>Что откатить</label><select id="rbMode"><option value="full">весь шаг</option><option value="items" ${mode==='items'?'selected':''} ${WZ2sel.size?'':'disabled'}>только выделенные пункты (${WZ2sel.size})</option><option value="group" ${WZ2f.group?'':'disabled'}>только выбранную группу</option></select></div>
- <div class="tablewrap" style="max-height:40vh;overflow:auto"><table class="table" style="min-width:600px"><thead><tr><th>Когда</th><th>Шаг</th><th>Событие</th><th>Состав</th><th>Кто</th><th></th></tr></thead><tbody>${S.map(x=>{const st=JSON.parse(x.stats_json||'{}');return `<tr><td>${esc(fmtDT(x.at))}</td><td>${x.step}</td><td>${esc(kindRu[x.kind]||x.kind)}<div class="kind">${esc(x.reason)}</div></td><td class="kind">${x.step===1?`объектов ${st.objects||0}, работ ${st.works||0}`:`групп ${st.groups||0}`}</td><td class="kind">${esc(x.by)}</td><td><button class="btn small" onclick="wz2RbPreview('${x.id}')">Откатить к этому…</button></td></tr>`}).join('')||'<tr><td colspan="6" class="empty">Снимков нет</td></tr>'}</tbody></table></div><div id="rbBox"></div><div class="dialogactions"><button class="btn" onclick="closeModal()">Закрыть</button></div></div>`)}
-function wz2RbBody(id){return {snapshot_id:id,mode:document.getElementById('rbMode').value,ids:[...WZ2sel],group_id:WZ2f.group}}
+ <div class="field"><label>Что откатить</label><select id="rbMode"><option value="full">весь шаг</option><option value="items" ${mode==='items'?'selected':''} ${WZ2sel.size?'':'disabled'}>только выделенные пункты (${WZ2sel.size})</option><option value="group" ${WZ2f.group?'':'disabled'}>только выбранную группу</option>${!step||step===1?`<option value="layer:norm" ${mode==='layer:norm'?'selected':''}>только нормативы (1.1)</option><option value="layer:material" ${mode==='layer:material'?'selected':''}>только материалы (1.3)</option>`:''}</select></div><div class="kind" style="margin:-4px 0 8px">Шаги 3–4 (сопоставление со сметой) откатываются только целиком.</div>
+ <div class="tablewrap" style="max-height:40vh;overflow:auto"><table class="table" style="min-width:600px"><thead><tr><th>Когда</th><th>Шаг</th><th>Событие</th><th>Состав</th><th>Кто</th><th></th></tr></thead><tbody>${S.map(x=>{const st=JSON.parse(x.stats_json||'{}');return `<tr><td>${esc(fmtDT(x.at))}</td><td>${x.step}</td><td>${esc(kindRu[x.kind]||x.kind)}<div class="kind">${esc(x.reason)}</div></td><td class="kind">${x.step===1?`объектов ${st.objects||0}, работ ${st.works||0}`+(st.norms?`, нормативов ${st.norms}`:'')+(st.materials?`, материалов ${st.materials}`:''):x.step===2?`групп ${st.groups||0}`:`привязок сметы ${st.alloc||0} (ручных ${st.manual||0})`}</td><td class="kind">${esc(x.by)}</td><td><button class="btn small" onclick="wz2RbPreview('${x.id}')">Откатить к этому…</button></td></tr>`}).join('')||'<tr><td colspan="6" class="empty">Снимков нет</td></tr>'}</tbody></table></div><div id="rbBox"></div><div class="dialogactions"><button class="btn" onclick="closeModal()">Закрыть</button></div></div>`)}
+function wz2RbBody(id){let m=document.getElementById('rbMode').value,layer='';if(m.startsWith('layer:')){layer=m.slice(6);m='layer'}const sn=WZ2.snapshots.find(x=>x.id===id);if(sn&&sn.step>=3)m='full';return {snapshot_id:id,mode:m,layer,ids:[...WZ2sel],group_id:WZ2f.group}}
 async function wz2RbPreview(id){try{const r=await api('/api/wz2/rollback',{method:'POST',body:JSON.stringify({...wz2RbBody(id),dry_run:true})});const c=r.counts;const box=document.getElementById('rbBox');
- box.innerHTML=`<div class="hintbox" style="margin-top:10px"><b>Что изменится (снимок от ${esc(fmtDT(r.snapshot))}):</b> ${r.step===1?`вернётся пунктов ${c.add}, уберётся ${c.remove}, изменится ${c.change}`:`групп +${c.groups_add}/−${c.groups_remove}, привязок объектов +${c.members_add}/−${c.members_remove}`}.${r.marks||r.acts?`<div class="notice" style="margin:8px 0">Затронуто отметок прораба: <b>${r.marks}</b>, актов: <b>${r.acts}</b>. Отметки не удаляются — сохранятся в истории.<label style="display:block;margin-top:6px"><input type="checkbox" id="rbMarks"> Подтверждаю откат с отметками прораба</label></div>`:''}<div class="field"><label>Причина отката (обязательно)</label><input id="rbReason" placeholder="например: ошибка в перечне; переделка по требованию технадзора"></div><button class="btn primary" onclick="wz2RbDo('${id}')">Выполнить откат</button> <span class="kind">После отката подтвердите шаг заново — тогда изменения попадут к прорабу.</span></div>`}catch(e){toast(e.message,true)}}
+ box.innerHTML=`<div class="hintbox" style="margin-top:10px"><b>Что изменится (снимок от ${esc(fmtDT(r.snapshot))}):</b> ${r.step===1?`вернётся пунктов ${c.add}, уберётся ${c.remove}, изменится ${c.change}`:r.step===2?`групп +${c.groups_add}/−${c.groups_remove}, привязок объектов +${c.members_add}/−${c.members_remove}`:`привязок сметы: вернётся ${c.alloc_add}, уберётся ${c.alloc_remove}, изменится ${c.alloc_change}${c.skipped_disabled?`; не восстановятся (объект выведен из перечня): ${c.skipped_disabled}`:''}. Шаг 4 нужно будет завершить заново`}.${r.marks||r.acts?`<div class="notice" style="margin:8px 0">Затронуто отметок прораба: <b>${r.marks}</b>, актов: <b>${r.acts}</b>. Отметки не удаляются — сохранятся в истории.<label style="display:block;margin-top:6px"><input type="checkbox" id="rbMarks"> Подтверждаю откат с отметками прораба</label></div>`:''}<div class="field"><label>Причина отката (обязательно)</label><input id="rbReason" placeholder="например: ошибка в перечне; переделка по требованию технадзора"></div><button class="btn primary" onclick="wz2RbDo('${id}')">Выполнить откат</button> <span class="kind">После отката подтвердите шаг заново — тогда изменения попадут к прорабу.</span></div>`}catch(e){toast(e.message,true)}}
 async function wz2RbDo(id){const m=document.getElementById('rbMarks');try{const r=await api('/api/wz2/rollback',{method:'POST',body:JSON.stringify({...wz2RbBody(id),reason:document.getElementById('rbReason').value,confirm_marks:!!(m&&m.checked)})});closeModal();toast(r.message);WZ2sel.clear();await wizLoad()}catch(e){toast(e.message,true)}}
 async function wz2Hist(item){try{const d=await api('/api/wz2/history'+(item?'?item='+encodeURIComponent(item):''));const ru={add:'добавлено',edit:'изменено',bulk:'массово',group:'группа','rollback-remove':'откат: убрано','rollback-restore':'откат: восстановлено',rollback:'откат',delete:'удалено'};
  openModal(`<div class="wz2wide"><h2>Журнал изменений</h2><div class="tablewrap" style="max-height:60vh;overflow:auto"><table class="table" style="min-width:640px"><thead><tr><th>Когда</th><th>Действие</th><th>Что</th><th>Причина</th><th>Кто</th></tr></thead><tbody>${d.history.map(h=>{let a={},b={};try{a=JSON.parse(h.after_json||'{}')||{};b=JSON.parse(h.before_json||'{}')||{}}catch{}return `<tr><td>${esc(fmtDT(h.at))}</td><td>${esc(ru[h.action]||h.action)}</td><td class="kind">${esc((a.key||b.key||a.name||b.name||h.item_kind)+'')}${b.name&&a.name&&a.name!==b.name?' : '+esc(b.name)+' → '+esc(a.name):''}${b.state&&a.state&&a.state!==b.state?' : '+esc(WZ2STATE[b.state]||b.state)+' → '+esc(WZ2STATE[a.state]||a.state):''}</td><td class="kind">${esc(h.reason)}</td><td class="kind">${esc(h.by)}</td></tr>`}).join('')||'<tr><td colspan="5" class="empty">Изменений нет</td></tr>'}</tbody></table></div><div class="dialogactions"><button class="btn" onclick="closeModal()">Закрыть</button></div></div>`)}catch(e){toast(e.message,true)}}

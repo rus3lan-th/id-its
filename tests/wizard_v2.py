@@ -65,7 +65,7 @@ for sid, (n_el, n_op, n_bl) in before.items():
     o = c0.execute("SELECT COUNT(*) FROM wz_items WHERE section_id=? AND layer='object'", (sid,)).fetchone()[0]
     w = c0.execute("SELECT COUNT(*) FROM wz_items WHERE section_id=? AND layer='work'", (sid,)).fetchone()[0]
     g = c0.execute("SELECT COUNT(*) FROM wz_groups WHERE section_id=?", (sid,)).fetchone()[0]
-    sn = c0.execute("SELECT COUNT(*) FROM wz_snapshots WHERE section_id=? AND kind='migration'", (sid,)).fetchone()[0]
+    sn = c0.execute("SELECT COUNT(*) FROM wz_snapshots WHERE section_id=? AND kind='migration' AND step IN (1,2)", (sid,)).fetchone()[0]
     code = c0.execute("SELECT code FROM sections WHERE id=?", (sid,)).fetchone()[0]
     check(o == n_el and w == n_op and g == n_bl and sn == 2, f"{code}: объектов {o}/{n_el}, работ {w}/{n_op}, групп {g}/{n_bl}, снимков миграции {sn}")
 A.init_db()

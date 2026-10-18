@@ -22,6 +22,15 @@ try:  # сценарий проверяет мастер с нуля: сбрас
     _c.execute("DELETE FROM list_wizard WHERE section_id=?", (a.section,)); _c.commit()
 except _sq.OperationalError:
     pass
+for _t in ("wz_group_members", "wz_groups", "wz_items", "wz_history", "wz_snapshots", "wz_state", "wz_remarks", "wz_notices"):  # и состояние мастера 2.0 (база после v90) — как «до мастера»
+    try:
+        if _t == "wz_group_members":
+            _c.execute("DELETE FROM wz_group_members WHERE group_id IN (SELECT id FROM wz_groups WHERE section_id=?)", (a.section,))
+        else:
+            _c.execute(f"DELETE FROM {_t} WHERE section_id=?", (a.section,))
+    except _sq.OperationalError:
+        pass
+_c.commit()
 _c.close()
 salt = b"0123456789abcdef"
 os.environ.update(APP_USER="wiztest", APP_PASSWORD_HASH="1000:%s:%s" % (salt.hex(), hashlib.pbkdf2_hmac("sha256", b"wiz", salt, 1000).hex()))
