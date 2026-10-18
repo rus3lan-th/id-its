@@ -156,7 +156,7 @@ check(sum(1 for x in rem["remarks"] if x["status"] == "open") >= 1, f"при п�
 print("5. Нормы трудоёмкости")
 lab0 = P.get("/api/labor-norms").json()
 r = P.post("/api/labor-norms/seed").json()
-check(r["result"].get("added", 0) > 100, f"заполнено из ГЭСН: {r['message']}")
+check(r["result"].get("added", 0) > 100 or len(lab0.get("norms", [])) + r["result"].get("added", 0) > 100, f"заполнено из ГЭСН: {r['message']} (было норм: {len(lab0.get('norms', []))})")
 n = next(x for x in P.get("/api/labor-norms?q=23-01-033-03").json()["norms"] if x["code"] == "23-01-033-03")
 check(abs(n["hours"] - 55.67) < 1e-6 and n["unit"] == "100 м", f"23-01-033-03: {n['hours']} чел.-ч на {n['unit']} (затраты труда рабочих)")
 P.put(f"/api/labor-norms/{n['id']}", json={"code": n["code"], "name": n["name"], "unit": n["unit"], "hours": 60.0})

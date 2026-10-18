@@ -14,6 +14,12 @@ a = ap.parse_args()
 tmp = tempfile.mkdtemp(prefix="idits-wz2-")
 DB = os.path.join(tmp, "db.sqlite3")
 shutil.copy(a.db, DB)
+_cc = sqlite3.connect(DB)   # сценарий начинается сразу после миграции v.90: слои норм/материалов, заполненные позже на живой базе, в копии убираем
+try:
+    _cc.execute("DELETE FROM wz_items WHERE layer NOT IN ('object','work')"); _cc.commit()
+except sqlite3.OperationalError:
+    pass
+_cc.close()
 os.environ.update(APP_USER="admin-test", APP_PASSWORD_HASH="1:00:00")
 for k, v in dict(APP_DB_PATH=DB, APP_FILES_DIR=a.files, APP_SEEDS_DIR=os.path.join(tmp, "s"), APP_OVERRIDE_DIR=os.path.join(tmp, "o"), APP_BACKUP_DIR=os.path.join(tmp, "b"),
                  APP_PHOTOS_DIR=os.path.join(tmp, "p"), APP_INBOX_DIR=os.path.join(tmp, "i"), APP_DATA_BACKUP_DIR=os.path.join(tmp, "d")).items():
