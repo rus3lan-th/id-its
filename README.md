@@ -68,3 +68,9 @@ python tests/grushevskaya_matching.py ... --app /dir/with/old/app.py            
     python tests/wizard_walkthrough.py --db /path/to/copy.sqlite3 --files /path/to/files [--json out.json]
 
 Состояние мастера хранится в таблице `list_wizard` (по разделу), статус объёма объекта — в `elements.scope` (`''` — наша работа, `excluded` — не делаем, `other` — другой подрядчик). Обе создаются при старте идемпотентно.
+
+### Мастер 2.0, этап Ф0 (v.90)
+
+    python tests/wizard_v2.py --db /path/to/copy.sqlite3 --files /path/to/files
+
+Рабочий перечень — `wz_items` (объекты, виды работ; дальше — материалы, нормативы), группы — `wz_groups`/`wz_group_members`, снимки шагов — `wz_snapshots` (gzip JSON), журнал правок — `wz_history`, состояние шагов — `wz_state`. Опубликованный перечень прораба (`elements`/`operations`) обновляется только при подтверждении шага 1 или 2: объект, ушедший из перечня, выключается (`enabled=0`), отметки остаются в истории. Миграция существующих разделов — при старте, идемпотентно.

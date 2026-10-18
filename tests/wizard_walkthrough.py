@@ -16,6 +16,13 @@ a = ap.parse_args()
 
 tmp = tempfile.mkdtemp(prefix="idits-wiz-")
 shutil.copy(a.db, os.path.join(tmp, "db.sqlite3"))
+import sqlite3 as _sq
+_c = _sq.connect(os.path.join(tmp, "db.sqlite3"))
+try:  # сценарий проверяет мастер с нуля: сбрасываем его состояние у проверяемого раздела (только в копии)
+    _c.execute("DELETE FROM list_wizard WHERE section_id=?", (a.section,)); _c.commit()
+except _sq.OperationalError:
+    pass
+_c.close()
 salt = b"0123456789abcdef"
 os.environ.update(APP_USER="wiztest", APP_PASSWORD_HASH="1000:%s:%s" % (salt.hex(), hashlib.pbkdf2_hmac("sha256", b"wiz", salt, 1000).hex()))
 for k, v in dict(APP_DB_PATH=os.path.join(tmp, "db.sqlite3"), APP_FILES_DIR=a.files, APP_SEEDS_DIR=os.path.join(tmp, "seeds"),
@@ -54,9 +61,9 @@ def check(cond, msg):
 
 
 w = st("0. исходно (база до мастера)")
-check(w["steps"][0]["status"] == "done" and w["steps"][0]["derived"], "шаг 1 должен считаться готовым по уже существующему перечню")
-check(w["steps"][2]["status"] == "locked", "шаг 3 до подтверждения перечня должен быть недоступен")
-call("POST", "/api/wizard/match", expect=409)
+# v.90: при миграции в мастер 2.0 прежний перечень считается подтверждённым (шаги 1–2) — автосопоставление доступно сразу
+check(w["steps"][0]["status"] == "done" and w["steps"][1]["status"] == "done", "шаги 1–2 подтверждены миграцией (перечень был до мастера)")
+check(w["steps"][2]["status"] == "work" and w["steps"][3]["status"] == "locked", "шаг 3 доступен, шаг 4 — только после сопоставления")
 call("POST", "/api/wizard/step", {"step": 4}, expect=409)
 
 an = call("POST", "/api/wizard/analyze")
