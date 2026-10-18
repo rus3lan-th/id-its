@@ -35,7 +35,7 @@ from pydantic import BaseModel, Field
 
 DB_PATH = Path(os.getenv("APP_DB_PATH", "/data/id_nvk.sqlite3"))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-app = FastAPI(title="ИД ИТС · НВК", version="2026.10.17.86")
+app = FastAPI(title="ИД ИТС · НВК", version="2026.10.18.87")
 
 
 # ---------- Доступ: логин и пароль (HTTP Basic), пароль хранится только в виде хеша ----------
@@ -2581,13 +2581,30 @@ def _suggest_core(c: sqlite3.Connection, sec: sqlite3.Row, ignore_have: bool = F
         est: list[dict[str, Any]] = []
         valves: list[dict[str, Any]] = []
         pending = 0
+        snets = set(_sec_nets(sec))
+        other_nets: dict[str, int] = {}
+
+        def _foreign(code: str, own: bool) -> bool:
+            """Шифр чужой сети (К1, К3 в разделе «К2, К2.1»): только если в файле есть шифры сетей раздела."""
+            m = re.match(r"\s*([А-ЯA-Z]{1,2}\d+(?:\.\d+)?)\s*[-–]", code or "")
+            if not (own and m and m.group(1) not in snets):
+                return False
+            other_nets[m.group(1)] = other_nets.get(m.group(1), 0) + 1
+            return True
+
+        def _has_own(codes: list[str]) -> bool:
+            return bool(snets) and any((m := re.match(r"\s*([А-ЯA-Z]{1,2}\d+(?:\.\d+)?)\s*[-–]", x or "")) and m.group(1) in snets for x in codes)
+
         for f in files:
             if f["status"] == "analyzing":
                 pending += 1
                 continue
             a = json.loads(f["analysis_json"] or "{}")
             if f["kind"] == "dxf_project" and a.get("codes"):
+                own = _has_own(a["codes"])
                 for code in a["codes"]:
+                    if _foreign(code, own):
+                        continue
                     if _norm_code(code) in have or code in wells:
                         continue
                     prefix = re.match(r"К\d+(?:\.\d+)?", code)
@@ -2601,8 +2618,11 @@ def _suggest_core(c: sqlite3.Connection, sec: sqlite3.Row, ignore_have: bool = F
                         c.execute("UPDATE source_files SET analysis_json=? WHERE id=?", (json.dumps(a, ensure_ascii=False), f["id"]))
                     except Exception:  # noqa: BLE001
                         a["pipes"] = []
+                own_p = _has_own([p["from"] for p in a.get("pipes") or []])
                 for p in a.get("pipes") or []:
                     code = f"{p['from']}–{p['to']}"
+                    if _foreign(p["from"], own_p):
+                        continue
                     if _norm_code(code) in have or code in wells:
                         continue
                     pre = re.match(r"К\d+(?:\.\d+)?", p["from"])
@@ -2690,13 +2710,13 @@ def _suggest_core(c: sqlite3.Connection, sec: sqlite3.Row, ignore_have: bool = F
         items, _ef = _work_items(c, sec, True)
         if items:       # смета загружена: в перечень идут только объекты, для которых в смете есть позиции; остальное — справочно
             cur = _alloc_elements(c, sec)
-            sug = [_el_dict("sg:" + x["code"], x["code"], x["name"], x["kind"], x.get("block", ""), x.get("planned_note", "")) for x in proj]
+            sug = [_el_dict("sg:" + x["code"], x["code"], x["name"], x["kind"], x.get("block", ""), x.get("planned_note", ""), _sec_nets(sec)) for x in proj]
             cov = _covered_ids(items, cur + sug)
             keep = [x for x, e in zip(proj, sug) if e["id"] in cov or x["kind"] not in ("Колодец", "Трубопровод", "Арматура", "Фитинг", "Оборудование", "Деталь колодца", "Узел")]
             reference = [x for x in proj if x not in keep]
             proj = keep
         return {"project": proj, "reference": reference,
-                "estimate": est, "valves": valves, "pending": pending, "section": sec["code"]}
+                "estimate": est, "valves": valves, "pending": pending, "section": sec["code"], "other_nets": other_nets}
 
 
 class BulkItem(BaseModel):
@@ -3665,6 +3685,12 @@ def backup_full(request: Request) -> StreamingResponse:
 
 # ---------------------------------------------------------------- Что нового (окно после обновления программы)
 RELEASE_NOTES: list[tuple[str, list[str]]] = [
+    ("2026.10.18.87", ["Сопоставление со сметой: колодцы любого вида («Колодец ж/б Ø1500», дождеприёмные, гасители) участвуют в раскладке; линейные и дождеприёмные колодцы различаются по подразделу и названию позиции сметы.",
+                       "Диаметр трубы читается и из записей «Dн 500», «DN/OD 800/669» (берётся наружный диаметр), «Ø400×23,7»; гофрированные трубы не путаются с гладкими напорными.",
+                       "В разделе из нескольких сетей (например К2 и К2.1) позиция главы «… К2.1» раскладывается только на объекты сети К2.1 — без двойного учёта.",
+                       "Земляные работы из подразделов «Колодцы линейные / дождеприёмные» относятся к колодцам (пропорционально объёму котлована по проекту), а не к трубам; устройство колодцев в м3 — пропорционально высоте колодца. Решение остаётся предложением до подтверждения ПТО.",
+                       "Единица сметы с множителем (100 м, 1000 м3) учитывается: для позиций в метрах показывается длина по проекту и расхождение со сметой.",
+                       "Автосоставление перечня из DXF не предлагает колодцы и участки чужих сетей (например К1, К3 в разделе К2, К2.1)."]),
     ("2026.10.17.86", ["«Перечень работ»: вверху закладки кнопки «Составить перечень автоматически» и «Добавить элемент вручную»; форма добавления элемента открывается только после нажатия на вторую кнопку."]),
     ("2026.10.17.85", ["«Захватки» заменены на «Состав раздела». Раздел состоит из составных частей, и теперь среди них есть «Узел»: кнопка «＋ Узел» заводит узел с операциями узла. К узлам относятся задвижки, краны, фланцы и комплектующие: кнопка «Отнести арматуру и фитинги к узлам» привязывает их к узлу своей сети (по шифру «В1-…»), если такой узел один, остальное переносит ПТО вручную. В составе раздела у узла показан его состав."]),
     ("2026.10.17.84", ["«Перечень работ»: закладки «Объекты и материалы по проекту», «Расценки сметы», «Материалы сметы». На каждой закладке показываются не сопоставленные (или частично сопоставленные) позиции, есть переключатель «Не сопоставленные / Все» и кнопка автоматического сопоставления со сметой. Нажатие на позицию сметы открывает привязку к объекту."]),
@@ -5018,8 +5044,84 @@ def _is_material(code: str, flags: Optional[str] = "") -> bool:
     return True
 
 
+# ---------------------------------------------------------------- сети раздела, вид колодца, множитель единицы (v.87)
+def _sec_nets(sec: sqlite3.Row) -> list[str]:
+    """Сети раздела из поля «Система» («К2, К2.1» → [К2.1, К2]); длинные шифры первыми, чтобы К2.1 не читалась как К2."""
+    try:
+        sysf = sec["system"] or ""
+    except (IndexError, KeyError):
+        sysf = ""
+    nets = {m.group(1) for m in re.finditer(r"(?<![\w.])([А-ЯA-Z]{1,2}\d+(?:\.\d+)?)(?![\w.])", sysf)}
+    return sorted(nets, key=lambda x: (-len(x), x))
+
+
+def _net_in_text(text: str, nets: list[str]) -> str:
+    """Сеть, названная в заголовке главы/подраздела сметы («Трубы К2.1» → К2.1). Только если в разделе больше одной сети."""
+    if len(nets) < 2:
+        return ""
+    for n in nets:
+        if re.search(r"(?<![\w.])" + re.escape(n) + r"(?![\w.]|\.\d)", text or ""):
+            return n
+    return ""
+
+
+def _code_net(code: str, nets: list[str]) -> str:
+    """Сеть объекта по началу шифра («К2.1-7 – К2.1-14» → К2.1, «К2-Дк.1» → К2). Только если в разделе больше одной сети."""
+    if len(nets) < 2:
+        return ""
+    for n in nets:
+        if re.match(r"\s*" + re.escape(n) + r"\s*[-–:]", code or ""):
+            return n
+    return ""
+
+
+def _net_els(it: dict[str, Any], els: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Объекты той же сети, что и позиция сметы; объекты без определённой сети остаются кандидатами."""
+    n = it.get("net") or ""
+    if not n:
+        return els
+    return [e for e in els if not e.get("net") or e["net"] == n]
+
+
+def _base_kind(kind: str) -> str:
+    """Базовый вид объекта: «Колодец ж/б Ø1500», «Колодец дождеприёмный Ø1000», «Колодец-гаситель …» → «Колодец»."""
+    return "Колодец" if re.match(r"\s*колодец", kind or "", re.I) else (kind or "")
+
+
+def _well_sub(text: str) -> str:
+    """Тип колодца: rain — дождеприёмный, linear — линейный (сборный канализационный), '' — не определён."""
+    t = (text or "").lower().replace("ё", "е")
+    if "дождеприем" in t:
+        return "rain"
+    if re.search(r"линейн|канализационн\w* колодц|колодц\w* канализац", t):
+        return "linear"
+    return ""
+
+
+def _pit_dims(note: str) -> tuple[float, float]:
+    """Объём котлована (a×b×(верх − дно)) и высота колодца по примечанию проекта; 0, если данных нет."""
+    t = (note or "").replace(",", ".")
+    m = re.search(r"котлован\s*(\d+(?:\.\d+)?)\s*[×xх]\s*(\d+(?:\.\d+)?)", t)
+    dn = re.search(r"дно\s+проект\s*(\d+(?:\.\d+)?)", t)
+    up = re.search(r"земля\s*(\d+(?:\.\d+)?)", t) or re.search(r"верх\s+проект\s*(\d+(?:\.\d+)?)", t)
+    h = float(up.group(1)) - float(dn.group(1)) if up and dn else 0.0
+    if h <= 0 or h > 15:
+        return 0.0, 0.0
+    vol = float(m.group(1)) * float(m.group(2)) * h if m else 0.0
+    return round(vol, 4), round(h, 4)
+
+
+def _unit_mult(units: str, kunit: float = 0.0) -> float:
+    """Множитель единицы сметы: KUnit из XML, иначе число в единице («100 м» → 100, «1000 м3» → 1000), иначе 1."""
+    if kunit and kunit > 0:
+        return float(kunit)
+    m = re.match(r"\s*(\d+(?:[.,]\d+)?)\s*[^\d\s]", units or "")
+    return float(m.group(1).replace(",", ".")) if m else 1.0
+
+
 def _work_items(c: sqlite3.Connection, sec: sqlite3.Row, mats: bool = False) -> tuple[list[dict[str, Any]], list[str]]:
     items: list[dict[str, Any]] = []
+    nets = _sec_nets(sec)
     files: list[str] = []
     for fname, t, est_id, est_title in _est_tables(c, sec):
         files.append(fname)
@@ -5041,7 +5143,8 @@ def _work_items(c: sqlite3.Connection, sec: sqlite3.Row, mats: bool = False) -> 
                     continue          # материалы и оборудование — в окне «Ожидаемые материалы»; здесь только работы
                 items.append({"key": _um.get(m["mk"], m["mk"]), "key_old": m["key_old"], "est": est_title, "chapter": ch["caption"], "sub": sub, "n": r["n"], "code": r["code"], "name": r["name"].strip(),
                               "units": r["units"].strip(), "plan": round(float(r["qty"]), 4), "plan_s": m["qty"], "formula": m["formula"],
-                              "mat": _is_material(r["code"], r.get("flags"))})
+                              "mat": _is_material(r["code"], r.get("flags")),
+                              "net": _net_in_text(ch["caption"] + " " + sub, nets), "kunit": _unit_mult(r["units"], r.get("kunit") or 0.0)})
     _attach_companions(items)
     return items, files
 
@@ -5057,7 +5160,7 @@ def _attach_companions(items: list[dict[str, Any]]) -> None:
             cur["comp"].append({"name": it["name"], "qty": it["plan"], "units": it["units"]})
 
 
-_FLAG_RX = {"es": r"закладн|электросвар|электронагрев", "steel": r"стал|12х18|нерж", "sewer": r"канализ|оранж"}
+_FLAG_RX = {"es": r"закладн|электросвар|электронагрев", "steel": r"стал|12х18|нерж", "sewer": r"канализ|оранж", "corr": r"гофр|профилированн"}
 
 
 def _flags(text: str) -> set[str]:
@@ -5088,11 +5191,16 @@ class WaFact(BaseModel):
     client_request_id: Optional[str] = Field(default=None, max_length=64)
 
 
+_EARTH_RX = re.compile(r"разработка грунта|засыпк|погрузк|перевозк|грунт|котлован", re.I)
+
+
 def _rule_kind(name: str, sub: str = "") -> str:
     """Как позиция сметы делится между участками: wells — по числу колодцев, line — по длине трассы, '' — вручную."""
     nm = (name or "").lower()
     if re.search(r"пробивк\w*.*колодц|отверсти\w*\s+в\s+колодц", (sub or "").lower()):
         return "wells"        # раздел сметы «Пробивка отверстий в колодцах»: работы и трубы-патрубки относятся к колодцам
+    if re.match(r"\s*колодц", (sub or "").lower()) and _EARTH_RX.search(nm):
+        return "wells"        # подраздел «Колодцы линейные / дождеприёмные» в земляных работах: котлованы колодцев, не траншея
     if re.search(r"усилен\w*\s+сборных\s+железобетон", nm):
         return "wells"
     if "колодц" in nm and "траншe" not in nm and "траншеи" not in nm:
@@ -5129,7 +5237,9 @@ def _alloc_elements(c: sqlite3.Connection, sec: sqlite3.Row) -> list[dict[str, A
     """Участки и колодцы перечня (позиции сметы «См-N» не входят): то, между чем делится смета."""
     out = []
     wtabs = _wells_tables(c, sec)
+    snets = _sec_nets(sec)
     for r in c.execute("SELECT id,code,name,kind,block,planned_note FROM elements WHERE section_id=? AND enabled=1 AND code NOT LIKE 'См-%' ORDER BY block, code", (sec["id"],)):
+        r = {**dict(r), "kind_full": r["kind"], "kind": _base_kind(r["kind"])}
         m = re.search(r"L\s*=\s*(\d+(?:[.,]\d+)?)\s*м", r["planned_note"] or "")
         cl = _obj_class(r["name"] + " " + (r["planned_note"] or "")) if r["kind"] in ("Арматура", "Фитинг", "Оборудование", "Деталь колодца") else None
         out.append({"id": r["id"], "code": r["code"], "name": r["name"], "kind": r["kind"], "block": r["block"], "len": float(m.group(1).replace(",", ".")) if m else 0.0,
@@ -5152,6 +5262,11 @@ def _alloc_elements(c: sqlite3.Connection, sec: sqlite3.Row) -> list[dict[str, A
                 out[-1]["conc"] = float(wt.get("conc") or 0)
         if out[-1]["len"] and not out[-1]["dn"]:
             out[-1]["dn"] = sorted(_dn_set(r["planned_note"] or ""))
+        out[-1]["kind_full"] = r["kind_full"]
+        out[-1]["net"] = _code_net(r["code"], snets)
+        if out[-1]["kind"] == "Колодец":
+            out[-1]["wsub"] = _well_sub(r["kind_full"] + " " + r["name"] + " " + (r["planned_note"] or ""))
+            out[-1]["pit"], out[-1]["height"] = _pit_dims(r["planned_note"] or "")
     return out
 
 
@@ -5224,7 +5339,13 @@ def alloc_list(section: Optional[str] = None) -> dict[str, Any]:
         for it in items:
             a = al.get(it["key"], [])
             got = round(sum(x["qty"] for x in a), 4)
-            rows.append({**{k: it[k] for k in ("key", "chapter", "n", "code", "name", "units", "plan", "mat")}, "sub": it.get("sub", ""), "rule": _row_rule(it, els), "cand": [e["id"] for e in _alloc_group(it, els)[0]], "cls": (_obj_class(it["name"]) or ("", "", "", ""))[3], "alloc": a, "allocated": got, "free": round(it["plan"] - got, 4)})
+            extra: dict[str, Any] = {"net": it.get("net", ""), "kunit": it.get("kunit", 1.0), "plan_phys": round(it["plan"] * (it.get("kunit") or 1.0), 4)}
+            if _rule_kind(it["name"], it.get("sub", "")) == "line" and re.fullmatch(r"(?:\d+\s*)?м\.?", (it["units"] or "").strip().lower()):
+                g, _w = _alloc_group(it, els)
+                if g and _dn_range(it["name"]) and not re.search(r"грунт|засыпк|песок|погрузк|перевозк", it["name"].lower()):
+                    pl = round(sum(e["len"] for e in g), 2)
+                    extra.update({"proj_len": pl, "len_diff": round(extra["plan_phys"] - pl, 2)})   # длина по проекту против сметы (в метрах)
+            rows.append({**{k: it[k] for k in ("key", "chapter", "n", "code", "name", "units", "plan", "mat")}, **extra, "sub": it.get("sub", ""), "rule": _row_rule(it, els), "cand": [e["id"] for e in _alloc_group(it, els)[0]], "cls": (_obj_class(it["name"]) or ("", "", "", ""))[3], "alloc": a, "allocated": got, "free": round(it["plan"] - got, 4)})
         return {"wells_comp": sum(1 for e in els if e["kind"] == "Колодец" and e.get("marks")), "rows": rows, "elements": els, "files": files, "lines": sum(1 for e in els if e["kind"] != "Колодец" and e["len"] > 0), "wells": sum(1 for e in els if e["kind"] == "Колодец")}
 
 
@@ -5237,6 +5358,7 @@ def _countable(units: str) -> bool:
 
 
 def _row_rule(it: dict[str, Any], els: list[dict[str, Any]]) -> str:
+    els = _net_els(it, els)
     r = _rule_kind(it["name"], it.get("sub", ""))
     if r:
         return r
@@ -5342,14 +5464,27 @@ def _pipe_cands(it: dict[str, Any], els: list[dict[str, Any]]) -> list[dict[str,
 
 def _alloc_group(it: dict[str, Any], els: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[float]]:
     """Объекты проекта, между которыми делится позиция сметы, и их веса."""
+    els = _net_els(it, els)                    # раздел из нескольких сетей: позиция главы «… К2.1» — только на объекты К2.1
     lines = [e for e in els if e["kind"] != "Колодец" and e["len"] > 0]
     wells = [e for e in els if e["kind"] == "Колодец"]
     kind = _rule_kind(it["name"], it.get("sub", ""))
     if kind == "line":
         rg = _dn_range(it["name"]) if not re.search(r"грунт|засыпк|песок|погрузк|перевозк", it["name"].lower()) else None
         lines_it = [e for e in lines if any(rg[0] < int(x) <= rg[1] for x in e["dn"])] if rg else lines
+        if rg and "corr" in _flags(it["name"]):          # профилированная (гофрированная) труба — только гофрированные участки
+            lines_it = [e for e in lines_it if "corr" in (e.get("flags") or set())]
+        elif rg and re.search(r"напорн", it["name"].lower()):
+            lines_it = [e for e in lines_it if "corr" not in (e.get("flags") or set())]
         return lines_it, [e["len"] for e in lines_it]
     if kind == "wells":
+        ws = _well_sub(it["name"] + " " + it.get("sub", ""))
+        if ws and any(e.get("wsub") == "rain" for e in wells):   # дождеприёмные выделены в проекте: остальные колодцы — линейные
+            wells = [e for e in wells if (e.get("wsub") == "rain") == (ws == "rain")]
+        unit = (it.get("units") or "").lower()
+        if wells and _EARTH_RX.search(it["name"]) and all(e.get("pit") for e in wells):
+            return wells, [float(e["pit"]) for e in wells]          # земляные работы колодцев — пропорционально объёму котлована
+        if wells and "м3" in unit and re.search(r"устройств\w*.*колодц", it["name"].lower()) and all(e.get("height") for e in wells):
+            return wells, [float(e["height"]) for e in wells]       # устройство колодцев (м3) — пропорционально высоте колодца
         return wells, [1.0] * len(wells)
     if kind == "nodes":
         nodes = [e for e in els if e["kind"] == "Узел"]
@@ -5370,9 +5505,10 @@ def _alloc_group(it: dict[str, Any], els: list[dict[str, Any]]) -> tuple[list[di
     return group, [e["qty"] for e in group]
 
 
-def _el_dict(eid: str, code: str, name: str, kind: str, block: str, note: str) -> dict[str, Any]:
+def _el_dict(eid: str, code: str, name: str, kind: str, block: str, note: str, nets: Optional[list[str]] = None) -> dict[str, Any]:
     """Объект перечня в виде, пригодном для сопоставления со сметой (из строки БД или из предложения)."""
     note = note or ""
+    kind_full, kind = kind, _base_kind(kind)
     m = re.search(r"L\s*=\s*(\d+(?:[.,]\d+)?)\s*м", note)
     cl = _obj_class(name + " " + note) if kind in ("Арматура", "Фитинг", "Оборудование", "Деталь колодца") else None
     e = {"id": eid, "code": code, "name": name, "kind": kind, "block": block, "len": float(m.group(1).replace(",", ".")) if m else 0.0,
@@ -5382,6 +5518,11 @@ def _el_dict(eid: str, code: str, name: str, kind: str, block: str, note: str) -
     e["conc"] = float(mc.group(1).replace(",", ".")) if mc else 0.0
     if e["len"] and not e["dn"]:
         e["dn"] = sorted(_dn_set(note))
+    e["kind_full"] = kind_full
+    e["net"] = _code_net(code, nets or [])
+    if kind == "Колодец":
+        e["wsub"] = _well_sub(kind_full + " " + name + " " + note)
+        e["pit"], e["height"] = _pit_dims(note)
     return e
 
 
@@ -5423,9 +5564,9 @@ def _alloc_auto_core(c: sqlite3.Connection, sec: sqlite3.Row, who: str, reset: i
             ck = _comp_key(it["name"]) if not _rule_kind(it["name"], it.get("sub", "")) else ""
             if ck:
                 # изделия колодцев: количество на колодец — ровно по таблице колодцев проекта, без пересчёта под смету
-                cm = _comp_match(it["name"], els)
+                cm = _comp_match(it["name"], _net_els(it, els))
                 tbl = round(sum(x for _, x in cm), 4)
-                npos = sum(1 for i2 in items if _comp_key(i2["name"]) == ck)
+                npos = sum(1 for i2 in items if _comp_key(i2["name"]) == ck and (i2.get("net") or "") == (it.get("net") or ""))
                 if cm and npos == 1 and abs(tbl - it["plan"]) < 0.0051:
                     for e, q in cm:
                         c.execute("INSERT INTO work_alloc (id,section_id,item_key,element_id,qty,mode,updated_by,updated_at) VALUES (?,?,?,?,?,?,?,?)",
@@ -10118,7 +10259,12 @@ def _obj_class(name: str) -> Optional[tuple[str, str, str, str, bool]]:
 def _dn_set(name: str) -> set[str]:
     nm = (name or "").replace("∅", "d").replace("Ø", "d").replace("ф", "d").replace("Ф", "d")
     out: set[str] = set()
-    for m in re.finditer(r"(?:\bdn|\bd|диаметром:?)\s*(\d{2,3})(?:\s*[-х×x/]\s*(\d{2,3}))?", nm, re.I):
+    for m in re.finditer(r"\bdn\s*/\s*od\s*(\d{2,4})(?:\s*/\s*\d{2,4})?", nm, re.I):   # «DN/OD 800/669»: наружный диаметр — первое число
+        out.add(m.group(1))
+    nm = re.sub(r"\bdn\s*/\s*od\s*\d{2,4}(?:\s*/\s*\d{2,4})?", " ", nm, flags=re.I)
+    for m in re.finditer(r"\b(?:dн|dу|дн|ду)\s*(\d{2,4})", nm, re.I):                 # «Dн 500», «Ду 150»
+        out.add(m.group(1))
+    for m in re.finditer(r"(?:\bdn|\bd|диаметром:?)\s*(\d{2,3})(?:\s*[-х×x/]\s*(\d{2,3})(?![.,]\d))?", nm, re.I):
         out.update(x for x in m.groups() if x)
     for m in re.finditer(r"(\d{2,3})\s*мм", nm):
         out.add(m.group(1))
@@ -10495,7 +10641,7 @@ def estimate_table(path: Path) -> dict[str, Any]:
         if wl is not None:
             works = [w.get("Caption", "") for w in wl.iter("Work") if w.get("Caption")]
         return {"t": "p", "n": el.get("Number", ""), "code": el.get("Code", ""), "name": el.get("Caption", ""), "units": el.get("Units", ""),
-                "qty": qty, "flags": el.get("ItemFlags", ""), "formula": formula[:200], "note": el.get("DBComment", ""), "works": works[:30], "res": res}
+                "kunit": _num(q.get("KUnit", "")) if q is not None and q.get("KUnit") else 0.0, "qty": qty, "flags": el.get("ItemFlags", ""), "formula": formula[:200], "note": el.get("DBComment", ""), "works": works[:30], "res": res}
 
     chapters: list[dict[str, Any]] = []
 
@@ -12488,7 +12634,7 @@ function listTabsRender(){const d=AL;if(!d||!document.getElementById('ltBody'))r
  const un=LTF==='un';let head='',body='',note='';
  const flt=`<span style="margin-left:8px"><button class="btn small ${un?'primary':''}" onclick="ltFilt('un')">Не сопоставленные</button> <button class="btn small ${un?'':'primary'}" onclick="ltFilt('all')">Все</button></span>`;
  if(LT==='proj'){head='<tr><th>Шифр</th><th>Наименование</th><th>Вид</th><th style="text-align:right">Кол-во по проекту</th><th>Позиции сметы</th></tr>';
-  const one=(l,title)=>{const ll=un?unE(l):l;if(!ll.length)return '';let h=`<tr><td colspan="5" style="background:#d9eceb;font-weight:700">${title} (${ll.length})</td></tr>`;ll.forEach(e=>{const m=by[e.id]||[];h+=`<tr><td>${esc(e.code)}</td><td>${esc(e.name)}</td><td>${esc(e.kind)}</td><td style="text-align:right">${e.len?waF(e.len)+' м':waF(e.qty||1)+' шт'}</td><td class="kind">${m.length?esc(m.slice(0,3).map(r=>r.name).join('; '))+(m.length>3?' …(+'+(m.length-3)+')':''):'<b style="color:#9b6200">нет в смете</b>'}</td></tr>`});return h};
+  const one=(l,title)=>{const ll=un?unE(l):l;if(!ll.length)return '';let h=`<tr><td colspan="5" style="background:#d9eceb;font-weight:700">${title} (${ll.length})</td></tr>`;ll.forEach(e=>{const m=by[e.id]||[];h+=`<tr><td>${esc(e.code)}</td><td>${esc(e.name)}</td><td>${esc(e.kind_full||e.kind)}</td><td style="text-align:right">${e.len?waF(e.len)+' м':waF(e.qty||1)+' шт'}</td><td class="kind">${m.length?esc(m.slice(0,3).map(r=>r.name).join('; '))+(m.length>3?' …(+'+(m.length-3)+')':''):'<b style="color:#9b6200">нет в смете</b>'}</td></tr>`});return h};
   body=one(works,'Работы: колодцы, участки, узлы')+one(mats,'Материалы и изделия: фитинги, арматура, оборудование');note=`Определено по данным проекта: объектов работ ${works.length}, материалов и изделий ${mats.length}. Без позиции сметы: ${unE(d.elements).length}.`+flt}
  else{const L=LT==='rate'?rw:rm,ll=un?unR(L):L;head='<tr><th>№</th><th>Шифр</th><th>Наименование</th><th>Ед.</th><th style="text-align:right">По смете</th><th style="text-align:right">Не распред.</th><th>Объекты проекта</th></tr>';
   const nm={};d.elements.forEach(e=>nm[e.id]=e.code);let ch='';
