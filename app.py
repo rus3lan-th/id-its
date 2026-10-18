@@ -37,7 +37,7 @@ from pydantic import BaseModel, Field
 
 DB_PATH = Path(os.getenv("APP_DB_PATH", "/data/id_nvk.sqlite3"))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-app = FastAPI(title="ИД ИТС · НВК", version="2026.10.18.92")
+app = FastAPI(title="ИД ИТС · НВК", version="2026.10.18.93")
 
 
 # ---------- Доступ: логин и пароль (HTTP Basic), пароль хранится только в виде хеша ----------
@@ -3697,6 +3697,7 @@ def backup_full(request: Request) -> StreamingResponse:
 
 # ---------------------------------------------------------------- Что нового (окно после обновления программы)
 RELEASE_NOTES: list[tuple[str, list[str]]] = [
+    ("2026.10.18.93", ["Сверка материалов: в замечаниях по позициям «есть в смете, нет в проекте» указывается единица из сметы; проценты расхождения — с запятой."]),
     ("2026.10.18.92", ["Мастер 2.0, сверка материалов: потери по умолчанию берутся из сметных нормативов — для труб из нормы ГЭСН той работы сметы, к которой относится труба (например, 23-01-033-03: 102,5 м труб на 100 м — потери 2,5 %), при отсутствии нормы — РДС 82-202-96 прил. З (наружные сети: пластмассовые 2,5 %, стальные сварные 1 %, чугунные, керамические, асбестоцементные и железобетонные 2 %); для колец, плит, люков и решёток — 0 % (в ГЭСН 23-03 они «по проекту», РДС 82-202-96 п. 5.2). У каждого значения указан источник; значение можно исправить, исправленное помечается.",
                        "Кольца стеновые колодцев (КС10/15/20 .3/.6/.9) считаются по глубине колодца: высота стенки = глубина − «верх» (люк, опорное кольцо, плита перекрытия; задаётся в шаблоне) с допуском 5 см, набирается кольцами .9 и одним .6 или .3. Колодцы без глубины в проекте отмечаются — кольца по ним не придумываются, расхождение показывается как «проект неполный».",
                        "Шаблоны изделий для колодцев Ø1000, Ø1500, Ø2000, дождеприёмных и для колодцев без указания типа: им присваивается преобладающий тип колодцев той же сети (с пометкой «принято»). Если у колодца есть состав из таблицы колодцев проекта — берётся он. Шаблоны редактируются в «Порог и потери…».",
@@ -7322,7 +7323,7 @@ def _wz2_compare(c: sqlite3.Connection, sid: str) -> dict[str, Any]:
             partial = rings_info[mser.group(1)]
             if st in ("over", "estimate_only"):
                 st = "partial"
-        out.append({"key": key, "name": (p or e)["name"], "unit": (p or e)["unit"], "cat": cat, "project": pq, "loss_pct": loss, "loss_src": lo["src"], "loss_edited": lo["edited"],
+        out.append({"key": key, "name": (p or e)["name"], "unit": (p and p["unit"]) or (e or {}).get("unit") or "", "cat": cat, "project": pq, "loss_pct": loss, "loss_src": lo["src"], "loss_edited": lo["edited"],
                     "need": need, "estimate": eq, "diff": diff, "pct": pct, "partial": partial,
                     "status": st, "rows": (e or {}).get("rows", []), "item_id": p["id"] if p else ""})
     return {"rows": out, "unrecognized": unrec, "threshold_pct": thr, "losses": {x["key"]: x["loss_pct"] for x in out}}
@@ -7372,7 +7373,7 @@ def wz2_mat_compare(request: Request, section: Optional[str] = None, dry_run: bo
                     impact = f"не определено: нет глубины у {pr['no_depth']} колодцев"
                 else:
                     text = (f"{x['name']}: по проекту {_fmt(x['project'])} {x['unit']}" + (f" + потери {_fmt(x['loss_pct'])} % ({x['loss_src']}) = {_fmt(x['need'])}" if x["loss_pct"] else "")
-                            + f", в смете {_fmt(x['estimate'])} {x['unit']} — {WZ2_CMP_ST[x['status']]} на {_fmt(abs(x['diff']))} {x['unit']} ({x['pct']:+g} %, порог {r['threshold_pct']:g} %).")
+                            + f", в смете {_fmt(x['estimate'])} {x['unit']} — {WZ2_CMP_ST[x['status']]} на {_fmt(abs(x['diff']))} {x['unit']} ({'+' if x['pct'] > 0 else ''}{_fmt(x['pct'])} %, порог {_fmt(r['threshold_pct'])} %).")
                     impact = f"{x['diff']:+.3f}".replace(".", ",") + f" {x['unit']}"
                 if x["partial"] and x["status"] != "partial":
                     text += f" Кольца посчитаны не по всем колодцам: у {x['partial']['no_depth']} из {x['partial']['wells']} нет глубины."
