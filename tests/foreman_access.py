@@ -57,7 +57,9 @@ print("1. Миграция: разделы с готовым перечнем с
 check(bool(gf and gf[0]), f"Грушевская передана при миграции ({gf[1] if gf else '—'})")
 check(n_gf == n_sec, f"переданы все разделы с перечнем: {n_gf} из {n_sec}")
 els = F.get("/api/elements" + q).json()
-check(isinstance(els, list) and len(els) == 86, f"прораб видит перечень: {len(els)} объектов")
+import sqlite3 as _sq
+N0 = _sq.connect(os.environ["APP_DB_PATH"]).execute("SELECT COUNT(*) FROM elements WHERE section_id=? AND enabled=1", (a.section,)).fetchone()[0]
+check(isinstance(els, list) and len(els) == N0, f"прораб видит перечень: {len(els)} объектов")
 ov = F.get("/api/overview" + q).json()
 check(ov.get("list_locked") is False, "в обзоре у прораба нет блокировки")
 op = next(o for e in els for o in e["operations"] if not o["event_type"])
@@ -81,7 +83,7 @@ check(ov.get("list_locked") is True and "Перечень готовит ПТО"
 r = F.post("/api/events", json={"operation_id": op["operation_id"], "performed_on": "2026-10-18", "actor": "Прораб тест"})
 check(r.status_code == 423 and "Перечень готовит ПТО" in r.text, f"отметка прораба отклонена: {r.status_code}")
 pe = P.get("/api/elements" + q).json()
-check(len(pe) == 86, f"ПТО (личный вход) видит перечень: {len(pe)}")
+check(len(pe) == N0, f"ПТО (личный вход) видит перечень: {len(pe)}")
 
 print("4. ПТО (личный вход, не администратор) проходит мастер")
 check(P.post("/api/wizard/step" + q, json={"step": 2}).status_code == 200, "ПТО подтверждает перечень")
@@ -93,15 +95,15 @@ check(r.status_code == 200, f"ПТО сопоставляет: {r.json().get('co
 check(F.get("/api/elements" + q).json() == [], "до «Завершить» прораб всё ещё не видит перечень")
 check(P.post("/api/wizard/step" + q, json={"step": 4}).status_code == 200, "ПТО нажимает «Завершить»")
 els = F.get("/api/elements" + q).json()
-check(len(els) == 85, f"после «Завершить» прораб видит перечень без объекта другого подрядчика: {len(els)}")
+check(len(els) == N0 - 1, f"после «Завершить» прораб видит перечень без объекта другого подрядчика: {len(els)}")
 r = F.post("/api/events", json={"operation_id": op["operation_id"], "performed_on": "2026-10-18", "actor": "Прораб тест"})
 check(r.status_code != 423, f"прораб снова может отмечать (ответ {r.status_code})")
 
 print("5. Проценты: объект другого подрядчика не считается")
 ov = P.get("/api/overview" + q).json()
-check(ov["elements"] == 85, f"обзор: объектов {ov['elements']}, операций {ov['operations']}, выполнено {ov['completed']}")
+check(ov["elements"] == N0 - 1, f"обзор: объектов {ov['elements']}, операций {ov['operations']}, выполнено {ov['completed']}")
 g = P.get("/api/gantt" + q).json()
 ge = sum(b.get("elements", 0) for b in g.get("blocks", g.get("rows", [])) if isinstance(b, dict))
-check(ge == 85, f"график: объектов в участках {ge}")
+check(ge == N0 - 1, f"график: объектов в участках {ge}")
 print("ОШИБКИ:" if fails else "ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ", *fails, sep="\n  ")
 sys.exit(1 if fails else 0)

@@ -16,6 +16,13 @@ a = ap.parse_args()
 
 tmp = tempfile.mkdtemp(prefix="idits-wiz-")
 shutil.copy(a.db, os.path.join(tmp, "db.sqlite3"))
+import sqlite3 as _sq
+_c = _sq.connect(os.path.join(tmp, "db.sqlite3"))
+try:  # сценарий проверяет мастер с нуля: сбрасываем его состояние у проверяемого раздела (только в копии)
+    _c.execute("DELETE FROM list_wizard WHERE section_id=?", (a.section,)); _c.commit()
+except _sq.OperationalError:
+    pass
+_c.close()
 salt = b"0123456789abcdef"
 os.environ.update(APP_USER="wiztest", APP_PASSWORD_HASH="1000:%s:%s" % (salt.hex(), hashlib.pbkdf2_hmac("sha256", b"wiz", salt, 1000).hex()))
 for k, v in dict(APP_DB_PATH=os.path.join(tmp, "db.sqlite3"), APP_FILES_DIR=a.files, APP_SEEDS_DIR=os.path.join(tmp, "seeds"),
