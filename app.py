@@ -36,7 +36,7 @@ from pydantic import BaseModel, Field
 
 DB_PATH = Path(os.getenv("APP_DB_PATH", "/data/id_nvk.sqlite3"))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-app = FastAPI(title="ИД ИТС · НВК", version="2026.10.18.88")
+app = FastAPI(title="ИД ИТС · НВК", version="2026.10.18.89")
 
 
 # ---------- Доступ: логин и пароль (HTTP Basic), пароль хранится только в виде хеша ----------
@@ -1516,14 +1516,15 @@ def delete_project(project_id: str) -> dict[str, str]:
 
 
 @app.get("/api/overview")
-def overview(section: Optional[str] = None) -> dict[str, Any]:
+def overview(request: Request, section: Optional[str] = None) -> dict[str, Any]:
     with db() as c:
         s = _section(c, section)
         sid = s["id"]
-        total = c.execute("SELECT COUNT(*) FROM elements WHERE section_id=? AND enabled=1", (sid,)).fetchone()[0]
-        ops = c.execute("SELECT COUNT(*) FROM operations o JOIN elements el ON el.id=o.element_id WHERE el.section_id=? AND el.enabled=1", (sid,)).fetchone()[0]
+        locked = _list_locked(request, c, s)
+        total = c.execute("SELECT COUNT(*) FROM elements WHERE section_id=? AND enabled=1 AND scope=''", (sid,)).fetchone()[0]
+        ops = c.execute("SELECT COUNT(*) FROM operations o JOIN elements el ON el.id=o.element_id WHERE el.section_id=? AND el.enabled=1 AND el.scope=''", (sid,)).fetchone()[0]
         done = c.execute("""SELECT COUNT(*) FROM operations o JOIN elements el ON el.id=o.element_id
-                            WHERE el.section_id=? AND el.enabled=1
+                            WHERE el.section_id=? AND el.enabled=1 AND el.scope=''
                             AND (SELECT e.event_type FROM events e WHERE e.operation_id=o.id ORDER BY e.created_at DESC LIMIT 1)='complete'""", (sid,)).fetchone()[0]
         docs = c.execute("SELECT COUNT(*) FROM documents WHERE section_id=? AND status!='Принят'", (sid,)).fetchone()[0]
         ver = c.execute("SELECT COALESCE(MAX(version),0) FROM schema_versions WHERE section_id=?", (sid,)).fetchone()[0]
@@ -1531,6 +1532,7 @@ def overview(section: Optional[str] = None) -> dict[str, Any]:
         project = {"object_name": s["object_name"], "address": s["address"], "section_code": s["code"], "section_title": s["title"],
                    "system": s["system"], "revision": rev["revision"] if rev else "—", "project_id": s["project_id"]}
         return {"project": project, "elements": total, "operations": ops, "completed": done, "documents_pending": docs,
+                "list_locked": locked, "list_locked_msg": LIST_LOCKED_MSG if locked else "",
                 "schema_version": ver, "missing_roles": _missing_roles(c, s["project_id"]),
                 "out_of_order": c.execute("""SELECT COUNT(*) FROM events e JOIN operations o ON o.id=e.operation_id JOIN elements el ON el.id=o.element_id
                                           WHERE el.section_id=? AND e.note LIKE '[ВНЕ ОЧЕРЕДИ]%'""", (sid,)).fetchone()[0],
@@ -1562,9 +1564,12 @@ def _elements(c: sqlite3.Connection, section_id: str) -> list[dict[str, Any]]:
 
 
 @app.get("/api/elements")
-def elements(section: Optional[str] = None) -> list[dict[str, Any]]:
+def elements(request: Request, section: Optional[str] = None) -> list[dict[str, Any]]:
     with db() as c:
-        return _elements(c, _section(c, section)["id"])
+        sec = _section(c, section)
+        if _list_locked(request, c, sec):
+            return []          # прорабу перечень не показываем, пока ПТО не нажал «Завершить» (сообщение — в /api/overview)
+        return _elements(c, sec["id"])
 
 
 @app.post("/api/elements", status_code=201)
@@ -1582,8 +1587,11 @@ def add_element(payload: ElementIn, section: Optional[str] = None) -> dict[str, 
 
 
 @app.post("/api/events", status_code=201)
-def add_event(payload: EventIn) -> dict[str, Any]:
+def add_event(request: Request, payload: EventIn) -> dict[str, Any]:
     with db() as c:
+        sr = c.execute("SELECT s.* FROM operations o JOIN elements el ON el.id=o.element_id JOIN sections s ON s.id=el.section_id WHERE o.id=?", (payload.operation_id,)).fetchone()
+        if sr and _list_locked(request, c, sr):
+            raise HTTPException(423, LIST_LOCKED_MSG)
         existing = c.execute("SELECT id FROM events WHERE client_request_id=?", (payload.client_request_id,)).fetchone()
         if existing:
             return {"id": existing["id"], "message": "Повторная отправка распознана; запись не продублирована"}
@@ -2777,7 +2785,7 @@ def gantt(section: Optional[str] = None) -> dict[str, Any]:
           SELECT el.id eid, el.block, el.weight, o.id oid, o.code ocode,
             (SELECT e.event_type FROM events e WHERE e.operation_id=o.id ORDER BY e.created_at DESC LIMIT 1) last,
             (SELECT e.performed_on FROM events e WHERE e.operation_id=o.id ORDER BY e.created_at DESC LIMIT 1) day
-          FROM elements el JOIN operations o ON o.element_id=el.id WHERE el.enabled=1 AND el.section_id=? ORDER BY el.block, el.created_at, o.sort_order""", (sid,)).fetchall()
+          FROM elements el JOIN operations o ON o.element_id=el.id WHERE el.enabled=1 AND el.scope='' AND el.section_id=? ORDER BY el.block, el.created_at, o.sort_order""", (sid,)).fetchall()
         per_el: dict[str, list[sqlite3.Row]] = {}
         for r in rows:
             per_el.setdefault(r["eid"], []).append(r)
@@ -3686,6 +3694,9 @@ def backup_full(request: Request) -> StreamingResponse:
 
 # ---------------------------------------------------------------- Что нового (окно после обновления программы)
 RELEASE_NOTES: list[tuple[str, list[str]]] = [
+    ("2026.10.18.89", ["Объекты «Не делаем» и «Другой подрядчик» не учитываются в процентах выполнения на «Обзоре», в графике и в прогрессе исполнительных схем.",
+                       "Прораб видит и отмечает перечень раздела только после того, как ПТО нажал «Завершить» на шаге 4 мастера; до этого — сообщение «Перечень готовит ПТО».",
+                       "Разделы, где перечень был составлен до мастера, считаются уже переданными прорабу — работа на объекте не останавливается."]),
     ("2026.10.18.88", ["Страница «Перечень работ» — мастер из 4 шагов вместо отдельных кнопок: 1) сформировать перечень по файлам проекта, 2) проверить и подтвердить, 3) сопоставить со сметой автоматически, 4) ручное сопоставление остатков и передача прорабу.",
                        "У каждого шага — статус (готово / в работе / недоступно / устарело) и счётчики; следующий шаг открывается только после предыдущего. Состояние хранится по разделу.",
                        "На шаге 2 ПТО отмечает объекты «Не делаем (исключено заказчиком)» или «Другой подрядчик» и правит реквизиты объекта; такие объекты не сопоставляются со сметой и не показываются прорабу.",
@@ -4438,7 +4449,7 @@ def _scheme_progress(c: sqlite3.Connection, section_id: str, key: str, zone: str
       SELECT el.id eid, el.code ecode, el.kind ekind, el.block eblock, o.code ocode, o.title otitle,
         (SELECT e.event_type FROM events e WHERE e.operation_id=o.id ORDER BY e.created_at DESC LIMIT 1) last,
         (SELECT MAX(e.created_at) FROM events e WHERE e.operation_id=o.id) lastat
-      FROM elements el JOIN operations o ON o.element_id=el.id WHERE el.enabled=1 AND el.section_id=?""", (section_id,)).fetchall()
+      FROM elements el JOIN operations o ON o.element_id=el.id WHERE el.enabled=1 AND el.scope='' AND el.section_id=?""", (section_id,)).fetchall()
     total = done = 0
     done_codes: set[str] = set()
     all_codes: set[str] = set()
@@ -5666,6 +5677,32 @@ def _init_wizard(c: sqlite3.Connection) -> None:
     """Идемпотентно: таблица состояния мастера и колонки статуса объёма у элементов перечня."""
     c.executescript(_WIZ_DDL)
     _ensure_cols(c, "elements", {"scope": "TEXT NOT NULL DEFAULT ''", "scope_note": "TEXT NOT NULL DEFAULT ''", "scope_by": "TEXT NOT NULL DEFAULT ''", "scope_at": "TEXT NOT NULL DEFAULT ''"})
+    _ensure_cols(c, "list_wizard", {"handed_at": "TEXT NOT NULL DEFAULT ''", "handed_by": "TEXT NOT NULL DEFAULT ''"})
+    c.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL DEFAULT '')")
+    if not c.execute("SELECT 1 FROM kv WHERE k='wizard_v89_grandfather'").fetchone():
+        # v.89: разделы, где перечень уже был до мастера, считаются переданными прорабу — полевая работа не блокируется
+        sids = [r[0] for r in c.execute("SELECT DISTINCT section_id FROM elements WHERE enabled=1 AND section_id IS NOT NULL")]
+        for sid in sids:
+            c.execute("INSERT OR IGNORE INTO list_wizard (section_id) VALUES (?)", (sid,))
+            c.execute("UPDATE list_wizard SET handed_at=?, handed_by='перечень до мастера (v.89)', updated_at=? WHERE section_id=? AND handed_at=''", (now(), now(), sid))
+        c.execute("INSERT INTO kv (k,v) VALUES ('wizard_v89_grandfather',?)", (json.dumps({"at": now(), "sections": len(sids)}),))
+
+
+LIST_LOCKED_MSG = "Перечень готовит ПТО. Отмечать работы можно будет после того, как ПТО завершит подготовку перечня (шаг 4 «Завершить»)."
+_LIST_LOCK_ROLES = {"foreman", "other"}
+
+
+def _list_locked(request: Request, c: sqlite3.Connection, sec: Any) -> bool:
+    """Прораб и только-просмотр не видят и не отмечают перечень раздела, пока ПТО не передал его (шаг 4 мастера)."""
+    login = getattr(request.state, "user", "") or ""
+    mem = _memberships(login) if login else None
+    if mem is None:
+        return False
+    role = _role_in(login, sec["project_id"], sec["id"]) or mem.get(sec["project_id"], "")
+    if role not in _LIST_LOCK_ROLES:
+        return False
+    r = c.execute("SELECT handed_at FROM list_wizard WHERE section_id=?", (sec["id"],)).fetchone()
+    return not (r and r[0])
 
 
 def _list_fp(c: sqlite3.Connection, sid: str) -> str:
@@ -5684,7 +5721,7 @@ def _match_fp(c: sqlite3.Connection, sid: str) -> str:
 
 def _wiz_row(c: sqlite3.Connection, sid: str) -> dict[str, Any]:
     r = c.execute("SELECT * FROM list_wizard WHERE section_id=?", (sid,)).fetchone()
-    return dict(r) if r else {k: "" for k in ("s1_at", "s1_by", "s2_at", "s2_by", "s2_fp", "s3_at", "s3_by", "s3_fp", "s4_at", "s4_by", "s4_fp")} | {"s1_json": "{}", "s3_json": "{}"}
+    return dict(r) if r else {k: "" for k in ("s1_at", "s1_by", "s2_at", "s2_by", "s2_fp", "s3_at", "s3_by", "s3_fp", "s4_at", "s4_by", "s4_fp", "handed_at", "handed_by")} | {"s1_json": "{}", "s3_json": "{}"}
 
 
 def _wiz_set(c: sqlite3.Connection, sid: str, **kv: str) -> None:
@@ -5743,7 +5780,8 @@ def _wizard_state(c: sqlite3.Connection, sec: sqlite3.Row) -> dict[str, Any]:
             pass
     steps = [s1, s2, s3, s4]
     cur_step = next((s["n"] for s in steps if s["status"] in ("work", "stale")), 4)
-    return {"section": sec["code"], "steps": steps, "current": cur_step, "handed_to_foreman": s4["status"] == "done", "scopes": SCOPES}
+    return {"section": sec["code"], "steps": steps, "current": cur_step, "handed_to_foreman": bool(w.get("handed_at")), "handed_at": w.get("handed_at", ""),
+            "handed_by": w.get("handed_by", ""), "scopes": SCOPES}
 
 
 @app.get("/api/wizard")
@@ -5798,7 +5836,7 @@ def wizard_step(request: Request, p: WizStep, section: Optional[str] = None) -> 
         else:
             if st["steps"][3]["status"] == "locked":
                 raise HTTPException(409, "Сначала выполните автоматическое сопоставление (шаг 3)")
-            _wiz_set(c, sid, s4_at=now(), s4_by=who, s4_fp=_match_fp(c, sid))
+            _wiz_set(c, sid, s4_at=now(), s4_by=who, s4_fp=_match_fp(c, sid), handed_at=now(), handed_by=who)
         audit(request, c, "wizard", sid, f"step{p.step}", f"Мастер перечня: шаг {p.step} «{s['title']}» выполнен", section_id=sid)
         return _wizard_state(c, sec)
 
@@ -12505,7 +12543,7 @@ function status(op){return op.event_type==='complete'}
 function renderSummary(){const rows=elements.map(el=>{const done=el.operations.filter(status).length,total=el.operations.length;return `<tr><td><span class="code">${esc(el.code)}</span><br><span class="kind">${esc(el.name)}</span></td><td>${esc(el.block)}</td><td>${done} из ${total} операций</td><td><span class="status ${done===total?'done':'todo'}">${done===total?'● Готово':'● В работе'}</span></td><td class="kind">${esc(el.planned_note||'—')}</td></tr>`}).join('');document.getElementById('summaryRows').innerHTML=rows||'<tr><td colspan="5" class="empty">Пока нет элементов</td></tr>'}
 function fillLists(){const set=a=>[...new Set(a.filter(Boolean))];let dl=document.getElementById('blkList');if(!dl){dl=document.createElement('datalist');dl.id='blkList';document.body.appendChild(dl);const k=document.createElement('datalist');k.id='kindList';document.body.appendChild(k)}dl.innerHTML=set(elements.map(e=>e.block)).map(b=>`<option value="${esc(b)}">`).join('');document.getElementById('kindList').innerHTML=set(['Колодец','Трубопровод','Камера','Выпуск',...elements.map(e=>e.kind)]).map(b=>`<option value="${esc(b)}">`).join('');const f=document.getElementById('elementForm');if(f){f.block.setAttribute('list','blkList');f.kind&&f.kind.tagName==='INPUT'&&f.kind.setAttribute('list','kindList')}}
 function fillBlocks(){fillLists();if(typeof zInit==='function')zInit();const sel=document.getElementById('blockFilter');const cur=sel.value;const blocks=[...new Set(elements.map(e=>e.block))];sel.innerHTML='<option value="">Все '+(typeof ZPL!=='undefined'?ZPL[ZT]:'блоки')+'</option>'+blocks.map(b=>`<option>${esc(b)}</option>`).join('');sel.value=cur}
-function renderWork(){const q=(document.getElementById('search')?.value||'').toLowerCase(),block=document.getElementById('blockFilter')?.value||'';let rows=[];for(const el of elements){if(block&&el.block!==block)continue;if(q&&!(el.code+' '+el.name+' '+el.block).toLowerCase().includes(q))continue;for(const op of el.operations){const done=status(op);rows.push(`<tr><td><span class="code">${esc(el.code)}</span><br><span class="kind">${esc(el.name)} · ${esc(el.block)} · <a style="cursor:pointer;text-decoration:underline dotted" title="Вес элемента в общем объёме (для диаграммы хода работ)" onclick="setWeight('${el.id}',${el.weight||1})">вес ${el.weight||1}</a></span></td><td>${esc(op.operation_title)} <a href="#" class="kind" title="Изменить операцию, статус, дату" onclick="event.preventDefault();workEdit('${op.operation_id}')">✎</a></td><td><span class="status ${done?'done':'todo'}">${done?'● Выполнено':'○ Не отмечено'}</span> <a href="#" class="kind" onclick="event.preventDefault();workEdit('${op.operation_id}')">✎</a></td><td>${esc(op.performed_on?op.performed_on.split('-').reverse().join('.'):'—')} <a href="#" class="kind" onclick="event.preventDefault();workEdit('${op.operation_id}')">✎</a></td><td><label class="checkrow"><input type="checkbox" ${done?'checked':''} onclick="event.preventDefault();toggle('${op.operation_id}',${done?'false':'true'})"><span class="personcell">${done?esc(op.actor):'Отметить'}</span></label></td></tr>`)}}document.getElementById('workRows').innerHTML=rows.join('')||'<tr><td colspan="5" class="empty">Ничего не найдено</td></tr>'}
+function renderWork(){const q=(document.getElementById('search')?.value||'').toLowerCase(),block=document.getElementById('blockFilter')?.value||'';let rows=[];for(const el of elements){if(block&&el.block!==block)continue;if(q&&!(el.code+' '+el.name+' '+el.block).toLowerCase().includes(q))continue;for(const op of el.operations){const done=status(op);rows.push(`<tr><td><span class="code">${esc(el.code)}</span><br><span class="kind">${esc(el.name)} · ${esc(el.block)} · <a style="cursor:pointer;text-decoration:underline dotted" title="Вес элемента в общем объёме (для диаграммы хода работ)" onclick="setWeight('${el.id}',${el.weight||1})">вес ${el.weight||1}</a></span></td><td>${esc(op.operation_title)} <a href="#" class="kind" title="Изменить операцию, статус, дату" onclick="event.preventDefault();workEdit('${op.operation_id}')">✎</a></td><td><span class="status ${done?'done':'todo'}">${done?'● Выполнено':'○ Не отмечено'}</span> <a href="#" class="kind" onclick="event.preventDefault();workEdit('${op.operation_id}')">✎</a></td><td>${esc(op.performed_on?op.performed_on.split('-').reverse().join('.'):'—')} <a href="#" class="kind" onclick="event.preventDefault();workEdit('${op.operation_id}')">✎</a></td><td><label class="checkrow"><input type="checkbox" ${done?'checked':''} onclick="event.preventDefault();toggle('${op.operation_id}',${done?'false':'true'})"><span class="personcell">${done?esc(op.actor):'Отметить'}</span></label></td></tr>`)}}document.getElementById('workRows').innerHTML=overviewData&&overviewData.list_locked?'<tr><td colspan="5" class="empty"><b>Перечень готовит ПТО</b><br>'+esc(overviewData.list_locked_msg)+'</td></tr>':(rows.join('')||'<tr><td colspan="5" class="empty">Ничего не найдено</td></tr>')}
 async function setWeight(id,w){const v=prompt('Вес элемента в общем объёме работ (число; по умолчанию 1). Например, длинный участок трубы — 5, колодец — 1:',w);if(v===null)return;const n=parseFloat(String(v).replace(',','.'));if(!(n>0)){toast('Нужно число больше нуля',true);return}try{await api('/api/elements/'+id+'/weight',{method:'PUT',body:JSON.stringify({weight:n})});await load();toast('Вес сохранён')}catch(e){toast(e.message,true)}}
 function workFind(id){for(const el of elements){const o=el.operations.find(x=>x.operation_id===id);if(o)return [el,o]}return [null,null]}
 function workEdit(id){const [el,op]=workFind(id);if(!op)return;const done=status(op);
@@ -12881,7 +12919,7 @@ function wizRender(){const W=WZ;if(!W)return;
   b.innerHTML=`<p class="sub" style="margin:0">Ниже — только то, что не сопоставилось автоматически. Нажмите на позицию сметы, чтобы привязать её к объекту. ${who(s)}</p>
   ${s.status==='stale'?'<div class="notice" style="margin:8px 0">Сопоставление устарело — повторите шаг 3.</div>':''}
   <div class="wkv"><span><b>${c.left_works??'—'}</b>работ сметы</span><span><b>${c.left_objects??'—'}</b>объектов проекта без сметы</span><span><b>${c.left_mats??'—'}</b>материалов</span></div>
-  <div class="wact">${s.status==='done'?'<span class="okline" style="align-self:center">Перечень передан прорабу</span><button class="btn" onclick="wizReopen(4)">Вернуть в работу</button>':`<button class="btn primary" onclick="wizFinish()">Завершить — передать перечень прорабу</button>`}</div>`;
+  <div class="wact">${s.status==='done'?'<span class="okline" style="align-self:center">Перечень передан прорабу</span><button class="btn" onclick="wizReopen(4)">Вернуть в работу</button>':`<button class="btn primary" onclick="wizFinish()">Завершить — передать перечень прорабу</button>`}${W.handed_to_foreman&&s.status!=='done'?`<span class="kind" style="align-self:center">Прораб уже видит перечень (${esc(W.handed_by||'')} · ${esc(fmtDT(W.handed_at))})</span>`:''}</div>`;
   LTF='un';if(!AL)listTabsLoad();else listTabsRender()}}
 function wizOpen(n){if(!WZ||WZ.steps[n-1].status==='locked')return;WZsel=n;wizRender()}
 async function wizAnalyze(){const b=document.getElementById('wizBody');try{toast('Анализируем файлы проекта…');await api('/api/wizard/analyze',{method:'POST'});await wizLoad()}catch(e){toast(e.message,true)}}
