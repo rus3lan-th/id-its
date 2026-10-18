@@ -37,6 +37,7 @@ import app as A  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 A.init_db()
+A._wells_dxf = lambda fid: {"sheet": {}, "profile": {}}   # v.94: глубины из DXF проверяет tests/wells_depth.py; здесь — путь «глубина только из перечня»
 fails, log = [], []
 
 
