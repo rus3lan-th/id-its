@@ -60,3 +60,11 @@ python tests/grushevskaya_matching.py --db /path/to/copy.sqlite3 --files /path/t
 python tests/grushevskaya_matching.py --db /path/to/copy.sqlite3 --files /path/to/files --all    # все разделы
 python tests/grushevskaya_matching.py ... --app /dir/with/old/app.py                             # прогон старой версии для сравнения
 ```
+
+### Мастер «Перечень работ» (v.88)
+
+Прогон всех 4 шагов через HTTP на копии базы (рабочую базу не трогает):
+
+    python tests/wizard_walkthrough.py --db /path/to/copy.sqlite3 --files /path/to/files [--json out.json]
+
+Состояние мастера хранится в таблице `list_wizard` (по разделу), статус объёма объекта — в `elements.scope` (`''` — наша работа, `excluded` — не делаем, `other` — другой подрядчик). Обе создаются при старте идемпотентно.
