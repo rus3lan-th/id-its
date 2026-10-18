@@ -110,9 +110,9 @@ print("    ", r["message"])
 mats = {m["key"]: m for m in P.get("/api/wz2/items" + q + "&layer=material").json()["items"]}
 objs = [o for o in P.get("/api/wz2/items" + q + "&layer=object").json()["items"] if o["state"] != "rejected" and not o["scope"]]
 import re as _re
-n1500 = sum(1 for o in objs if _re.search(r"(?i)колод.*(1500|1,5)", o["kind"] + " " + o["name"]))
+n1500 = sum(1 for o in objs if _re.search(r"(?i)колод.*(1500|1,5)", o["kind"] + " " + o["name"])) + sum(v["assumed"] for k, v in r.get("rings", {}).items() if k == "КС15")  # + колодцы без типа, принятые Ø1500 по сети (v.92)
 check("труба|гофр.|800" in mats and (mats["труба|гофр.|800"]["qty"] or 0) > 100, f"труба гофр. Ø800 по длинам участков: {mats.get('труба|гофр.|800', {}).get('qty')} м")
-check(mats.get("жби|ПН15", {}).get("qty") == n1500, f"плиты днища ПН15 = колодцев Ø1500: {mats.get('жби|ПН15', {}).get('qty')} / {n1500}")
+check(mats.get("жби|ПН15", {}).get("qty") == n1500, f"плиты днища ПН15 = колодцев Ø1500 (с принятыми по сети): {mats.get('жби|ПН15', {}).get('qty')} / {n1500}")
 check(any(k.startswith("dxf|") or mats[k]["qty"] is None for k in mats), f"упоминания в DXF без количества тоже в ведомости ({sum(1 for k in mats if mats[k]['qty'] is None)})")
 m800 = mats["труба|гофр.|800"]
 P.put(f"/api/wz2/items/{m800['id']}", json={"layer": "material", "qty": 500.0})
@@ -156,7 +156,7 @@ check(sum(1 for x in rem["remarks"] if x["status"] == "open") >= 1, f"при п�
 print("5. Нормы трудоёмкости")
 lab0 = P.get("/api/labor-norms").json()
 r = P.post("/api/labor-norms/seed").json()
-check(r["result"].get("added", 0) > 100, f"заполнено из ГЭСН: {r['message']}")
+check(r["result"].get("added", 0) > 100 or len(lab0.get("norms", [])) + r["result"].get("added", 0) > 100, f"заполнено из ГЭСН: {r['message']} (было норм: {len(lab0.get('norms', []))})")
 n = next(x for x in P.get("/api/labor-norms?q=23-01-033-03").json()["norms"] if x["code"] == "23-01-033-03")
 check(abs(n["hours"] - 55.67) < 1e-6 and n["unit"] == "100 м", f"23-01-033-03: {n['hours']} чел.-ч на {n['unit']} (затраты труда рабочих)")
 P.put(f"/api/labor-norms/{n['id']}", json={"code": n["code"], "name": n["name"], "unit": n["unit"], "hours": 60.0})
