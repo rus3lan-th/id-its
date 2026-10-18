@@ -2642,10 +2642,11 @@ def _suggest_core(c: sqlite3.Connection, sec: sqlite3.Row, ignore_have: bool = F
                     wells[code] = {"code": code, "name": f"Участок {p['from']} – {p['to']}", "kind": "Трубопровод", "block": f"Участки {pre.group(0)}" if pre else "Участки",
                                    "planned_note": note, "source": "project", "ops": OBJ_OPS["Трубопровод"], "file": f["name"]}
             if f["kind"] == "pdf" and str(f["name"]).lower().endswith(".pdf"):
-                if "pipes" not in a:                       # участки из таблиц PDF-профилей; считаем один раз и запоминаем
+                if "pipes" not in a or a.get("pipes_v") != PDF_PIPES_VER:   # участки из таблиц PDF-профилей; считаем один раз (и при новой версии разбора)
                     try:
                         with _ANALYSIS_SLOT:
                             a["pipes"] = extract_pipes_pdf(_pdf_pages_words(FILES_DIR / f["id"]))
+                        a["pipes_v"] = PDF_PIPES_VER
                         c.execute("UPDATE source_files SET analysis_json=? WHERE id=?", (json.dumps(a, ensure_ascii=False), f["id"]))
                     except Exception:  # noqa: BLE001
                         a["pipes"] = []
@@ -2662,10 +2663,12 @@ def _suggest_core(c: sqlite3.Connection, sec: sqlite3.Row, ignore_have: bool = F
                                    "block": f"Участки {p['net']}" if p.get("net") else "Участки", "planned_note": note, "source": "project",
                                    "ops": OBJ_OPS["Трубопровод"], "file": f["name"]}
                 for p in a.get("pipes") or []:         # колодцы — точки профиля с номером «1», «2» …
+                    if fnet:                                # сеть — как у участков (по имени файла), иначе колодец «К1» читается как сеть К1
+                        p = {**p, "net": fnet.group(1)}
                     for pt in (p["from"], p["to"]):
                         if re.fullmatch(r"\d{1,3}", pt):
                             wc = f"{p['net']}-К{pt}" if p.get("net") else f"К{pt}"
-                            if _norm_code(wc) not in have and wc not in wells:
+                            if _norm_code(wc) not in have and wc not in wells and _norm_code(f"К{pt}") not in have:   # «К{n}» — шифр до v.95
                                 wells[wc] = {"code": wc, "name": f"Колодец № {pt}" + (f" ({p['net']})" if p.get("net") else ""), "kind": "Колодец",
                                              "block": f"Колодцы {p['net']}" if p.get("net") else "Колодцы", "planned_note": "по профилю проекта (PDF)", "source": "project",
                                              "ops": OBJ_OPS["Колодец"], "file": f["name"]}
@@ -5810,6 +5813,24 @@ def wizard_get(section: Optional[str] = None) -> dict[str, Any]:
         return _wizard_state(c, _section(c, section))
 
 
+def _list_foreign(c: sqlite3.Connection, sec: Any) -> dict[str, Any]:
+    """Уже в перечне: объекты чужих сетей (по шифру «К1-…», «К2: …») и объекты с теми же шифрами в других разделах объекта — возможный двойной счёт."""
+    snets = set(_sec_nets(sec))
+    els = c.execute("SELECT code FROM elements WHERE section_id=? AND enabled=1 AND coalesce(scope,'')=''", (sec["id"],)).fetchall()
+    foreign: collections.Counter = collections.Counter()
+    for (code,) in els:
+        m = re.match(r"\s*([А-ЯA-Z]{1,2}\d+(?:\.\d+)?)\s*[-–:]", code or "")
+        if snets and m and m.group(1) not in snets:
+            foreign[m.group(1)] += 1
+    mine = {_norm_code(r[0]) for r in els}
+    dup: collections.Counter = collections.Counter()
+    for code, scode in c.execute("SELECT e.code, s.code FROM elements e JOIN sections s ON s.id=e.section_id WHERE s.project_id=? AND s.id<>? AND e.enabled=1 AND coalesce(e.scope,'')=''",
+                                 (sec["project_id"], sec["id"])):
+        if _norm_code(code) in mine:
+            dup[scode] += 1
+    return {"list_other_nets": dict(foreign), "dup_other_sections": dict(dup)}
+
+
 @app.post("/api/wizard/analyze")
 def wizard_analyze(request: Request, section: Optional[str] = None) -> dict[str, Any]:
     """Шаг 1: анализ файлов проекта раздела — что найдено (новые объекты по видам, чужие сети, позиции сметы без объекта)."""
@@ -5818,7 +5839,7 @@ def wizard_analyze(request: Request, section: Optional[str] = None) -> dict[str,
         s = _suggest_core(c, sec)
         found = {"new_project": len(s["project"]), "new_by_kind": dict(collections.Counter(x["kind"] for x in s["project"])),
                  "reference": len(s.get("reference") or []), "estimate_positions": len(s.get("estimate") or []), "valves": len(s.get("valves") or []),
-                 "other_nets": s.get("other_nets") or {}, "pending": s.get("pending", 0), "at": now()}
+                 "other_nets": s.get("other_nets") or {}, "pending": s.get("pending", 0), "at": now(), **_list_foreign(c, sec)}
         _wiz_set(c, sec["id"], s1_json=json.dumps(found, ensure_ascii=False))
         return {"found": found, "state": _wizard_state(c, sec)}
 
@@ -6700,7 +6721,7 @@ def _wz2_unit(u: str) -> tuple[float, str]:
 
 def _wz2_pipe(s: str) -> Optional[dict[str, Any]]:
     """Тип и диаметр трубы из надписи / примечания / позиции сметы."""
-    t = (s or "").replace("%%C", "Ø").replace("%%c", "Ø")
+    t = re.sub(r"(?i)DN\s*/\s*[OО]\s*D", "DN/OD", (s or "").replace("%%C", "Ø").replace("%%c", "Ø"))   # «DN/ОD» с кириллической О — из смет
     tl = t.lower()
     typ = ""
     if "гофр" in tl or "двухслойн" in tl or "dn/od" in tl or "корсис" in tl:
@@ -7000,6 +7021,20 @@ def _wz2_mat_project(c: sqlite3.Connection, sec: Any) -> dict[str, Any]:
     rings: dict[str, dict[str, Any]] = {}      # серия → {wells, no_depth: [...], assumed}
     wd = _wz2_well_depths(c, sec)
     sheet_used: list[str] = []
+    pdf_pipes: dict[str, dict[str, Any]] = {}
+    broken: list[str] = []
+    for f in _wz2_sec_files(c, sec, ("pdf",)):
+        r = _pdf_pipes(f["id"])
+        if r.get("text_broken"):
+            broken.append(f["name"])
+        fnet = re.search(r"Н([ВК]\d+)", str(f["name"]))
+        for pp in r.get("pipes") or []:
+            if not pp.get("spec"):
+                continue
+            net = fnet.group(1) if fnet else pp.get("net", "")
+            pdf_pipes.setdefault(_norm_code(f"{net + ': ' if net else ''}{pp['from']}–{pp['to']}"), pp)
+    if broken:
+        skipped["pdf_text_broken"] = len(broken)
 
     def add(key: str, name: str, unit: str, cat: str, qty: float, obj: str, how: str) -> None:
         m = mats.setdefault(key, {"key": key, "name": name, "unit": unit, "cat": cat, "qty": 0.0, "by": [], "how": how, "hows": collections.Counter()})
@@ -7014,7 +7049,13 @@ def _wz2_mat_project(c: sqlite3.Connection, sec: Any) -> dict[str, Any]:
         kind = (o["kind"] or "").lower()
         if "трубопровод" in kind or re.search(r"\bL\s*=\s*\d", txt):
             mL = re.search(r"L\s*=\s*(\d+(?:[.,]\d+)?)", txt)
-            p = _wz2_pipe(o["note"] or o["name"])
+            src = o["note"] or o["name"]
+            p = _wz2_pipe(src)
+            how = "сумма длин участков (L из перечня)"
+            if (not p or not p["type"]) and _norm_code(o["key"]) in pdf_pipes:     # в перечне нет диаметра — подпись трубы из профиля PDF
+                src = pdf_pipes[_norm_code(o["key"])]["spec"]
+                p = _wz2_pipe(src) or p
+                how = "сумма длин участков (L из перечня, труба — по подписи профиля PDF)"
             if not mL or not p:
                 skipped["pipe_no_data"] += 1
                 continue
@@ -7022,9 +7063,9 @@ def _wz2_mat_project(c: sqlite3.Connection, sec: Any) -> dict[str, Any]:
             if not p["type"]:
                 no_type.append((o["key"], p["dn"], L))
                 continue
-            k = _wz2_mat_key(o["note"] or o["name"], pipe_hint=True)
+            k = _wz2_mat_key(src, pipe_hint=True)
             if k:
-                add(k[0], k[1], k[2], k[3], L, o["key"], "сумма длин участков (L из перечня)")
+                add(k[0], k[1], k[2], k[3], L, o["key"], how)
             continue
         if "колод" not in kind or "деталь" in kind:
             continue
@@ -7109,7 +7150,7 @@ def _wz2_mat_project(c: sqlite3.Connection, sec: Any) -> dict[str, Any]:
             x["count"] += 1
     rings_info = {k: {"wells": v["wells"], "no_depth": len(v["no_depth"]), "no_depth_keys": v["no_depth"][:60], "assumed": v["assumed"], "by_src": dict(v.get("by_src") or {})} for k, v in rings.items()}
     depth = {**_wz2_depth_summary(wd), "sheet_comp": len(sheet_used)}
-    return {"mats": mats, "dxf": dxf, "skipped": dict(skipped), "rings": rings_info, "depth": depth}
+    return {"mats": mats, "dxf": dxf, "skipped": dict(skipped), "rings": rings_info, "depth": depth, "broken_pdf": broken}
 
 
 @app.post("/api/wz2/materials/fill")
@@ -7143,6 +7184,7 @@ def wz2_mat_fill(request: Request, section: Optional[str] = None) -> dict[str, A
         return {"result": dict(res), "skipped": sk, "message": f"Материалы: из перечня {len(pm['mats'])} позиций, упоминаний в DXF {len(pm['dxf'])}"
                 + (f"; участков без длины или диаметра: {sk.get('pipe_no_data', 0)}" if sk.get("pipe_no_data") else "")
                 + (f"; колодцев без шаблона материалов: {sk.get('well_no_template', 0)}" if sk.get("well_no_template") else "")
+                + (f"; PDF с испорченным текстовым слоем (не читается, нужен DXF или другой PDF): {', '.join(pm['broken_pdf'])}" if pm.get("broken_pdf") else "")
                 + (f"; глубины колодцев: {pm['depth']['with_depth']} из {pm['depth']['wells']}, состав по ведомости колодцев DXF — {pm['depth']['sheet_comp']}" if pm["depth"]["wells"] else "")
                 + (f", проверить {len(pm['depth']['check_keys'])}" if pm["depth"]["check_keys"] else "")
                 + "".join(f"; {ser}: глубина не указана у {v['no_depth']} из {v['wells']} колодцев — кольца по ним не посчитаны" for ser, v in pm["rings"].items() if v["no_depth"])
@@ -12781,7 +12823,7 @@ def extract_pipes_pdf(pages: list[list[tuple[float, float, float, str]]]) -> lis
                 tt = " ".join(x[3] for x in sorted([x for x in pg if abs(x[1] - title[1]) < 6 and x[0] >= title[0]], key=lambda x: x[0]))
                 m = re.search(r"сети\s+(\S+?)\.?(?:\s|$)", tt)
                 net = m.group(1) if m else ""
-            labs = [w for w in pg if w[3].startswith("ПЭ") and ry - 140 < w[1] < ry - 40]
+            labs = [w for w in pg if (w[3].startswith("ПЭ") or re.match(r"(?i)DN/[OО]D\s*\d{2,4}|DN/[OО]D$", w[3])) and ry - 140 < w[1] < ry - 40]   # ПЭ (напорные) и DN/OD (гофр. самотёчные)
             cs = [(d[0] + d[2]) / 2 for d in dist]
             npair = len(pts) - 1
             if len(dist) > npair:
@@ -12818,10 +12860,15 @@ def extract_pipes_pdf(pages: list[list[tuple[float, float, float, str]]]) -> lis
                         return (min(x[0] for x in ln) + max(x[2] for x in ln)) / 2
                     b = min(labs, key=lambda w: abs(lab_c(w) - c))
                     lt = " ".join(w[3] for w in sorted([w for w in pg if -3 <= w[1] - b[1] < 16 and b[0] - 5 <= w[0] < b[0] + 170], key=lambda w: (round(w[1] / 6), w[0])))
-                    mm, ms = re.search(r"ПЭ\s*(\d+)", lt), re.search(r"SDR\s*(\d+)", lt)
-                    md = re.search(r"(\d{2,3})\s*[хx]\s*(\d+(?:[.,]\d+)?)", lt)
-                    spec = ("ПЭ" + (mm.group(1) if mm else "")) + (f" SDR{ms.group(1)}" if ms else "") + (f" {md.group(1)}х{md.group(2)}" if md else "")
-                    dn = md.group(1) if md else ""
+                    mg = re.search(r"(?i)DN/[OО]D\s*(\d{2,4})", lt) if not b[3].startswith("ПЭ") else None
+                    if mg:                                    # «Труба DN/OD250 SN8», «Труба Polycorr DN/OD630 SN8» — гофрированная
+                        sn = re.search(r"(?i)S\s?N\s?(\d{1,2})", lt[mg.end():mg.end() + 30])
+                        spec, dn = f"труба гофр. DN/OD {mg.group(1)}" + (f" SN{sn.group(1)}" if sn else ""), mg.group(1)
+                    else:
+                        mm, ms = re.search(r"ПЭ\s*(\d+)", lt), re.search(r"SDR\s*(\d+)", lt)
+                        md = re.search(r"(\d{2,3})\s*[хx]\s*(\d+(?:[.,]\d+)?)", lt)
+                        spec = ("ПЭ" + (mm.group(1) if mm else "")) + (f" SDR{ms.group(1)}" if ms else "") + (f" {md.group(1)}х{md.group(2)}" if md else "")
+                        dn = md.group(1) if md else ""
                 fr, to = pts[k][1], pts[k + 1][1]
                 res.setdefault((net, fr, to), {"from": fr, "to": to, "len": round(L, 2), "dn": dn, "net": net, "spec": spec})
     return list(res.values())
@@ -13047,6 +13094,38 @@ def analyze_any(path: Path, name: str) -> dict[str, Any]:
     return {}
 
 
+PDF_PIPES_VER = 2      # v.95: подписи гофрированных труб «DN/OD…» в профилях
+
+
+def _pdf_text_broken(pages: list[list[tuple[float, float, float, str]]]) -> bool:
+    """Текстовый слой PDF испорчен (шрифты без таблицы кодировки: кириллица читается как «ц»)."""
+    cyr = re.findall(r"[А-Яа-яЁё]", " ".join(w[3] for pg in pages for w in pg))
+    return len(cyr) > 300 and cyr.count("ц") / len(cyr) > 0.3
+
+
+def _pdf_pipes(fid: str) -> dict[str, Any]:
+    """Участки PDF-профилей текущей версией разбора (кэш рядом с файлом) — для ведомости материалов, без записи в базу."""
+    p = FILES_DIR / fid
+    cache = FILES_DIR / f"{fid}.pipes.v{PDF_PIPES_VER}.json"
+    try:
+        if cache.exists() and p.exists() and cache.stat().st_mtime >= p.stat().st_mtime:
+            return json.loads(cache.read_text("utf-8"))
+    except Exception:  # noqa: BLE001
+        pass
+    if not p.exists():
+        return {"pipes": [], "text_broken": False}
+    try:
+        words = _pdf_pages_words(p)
+        res = {"pipes": extract_pipes_pdf(words), "text_broken": _pdf_text_broken(words)}
+    except Exception as e:  # noqa: BLE001
+        return {"pipes": [], "text_broken": False, "error": str(e)[:200]}
+    try:
+        cache.write_text(json.dumps(res, ensure_ascii=False), "utf-8")
+    except OSError:
+        pass
+    return res
+
+
 def analyze_pdf_project(path: Path) -> dict[str, Any]:
     """Разбор PDF проекта целиком: участки, таблица колодцев, спецификация, узлы. Каждая часть независима — сбой одной не рушит остальные."""
     out: dict[str, Any] = {}
@@ -13059,6 +13138,9 @@ def analyze_pdf_project(path: Path) -> dict[str, Any]:
             out[key] = fn()
         except Exception:  # noqa: BLE001
             out[key] = []
+    out["pipes_v"] = PDF_PIPES_VER
+    if words is not None and _pdf_text_broken(words):
+        out["text_broken"] = True
     return out
 
 
@@ -14992,7 +15074,7 @@ function wizRender(){const W=WZ2;if(!W)return;
   <div class="wact" style="border-top:1px solid var(--line);padding-top:10px"><button class="btn primary" onclick="wz2Confirm('2')" ${W.steps[0].status!=='done'?'disabled title="Сначала подтвердите шаг 1"':''}>${s.status==='done'?'Подтвердить заново':'Подтвердить состав → в перечень'}</button><button class="btn" onclick="wz2Journal(2)">Откатить шаг 2…</button>${s.at?`<span class="kind" style="align-self:center">подтверждён ${esc(fmtDT(s.at))} · ${esc(s.by||'')}</span>`:''}</div>`;WZ2f.layer='object';wz2GroupsLoad()}}
 function wz2SubRender(){const box=document.getElementById('wz2SubBody');if(!box)return;const x=WZ2.steps[0].sub.find(y=>y.id===WZ2sub);
  const foot=`<div class="wact"><button class="btn small" onclick="wz2Confirm('${x.id}')">Подшаг выполнен</button>${x.phase!=='Ф0'?`<button class="btn small" onclick="wz2Confirm('${x.id}','skip')">Пропустить</button>`:''}</div>`;
- if(WZ2sub==='1.0'){const o=WZ&&WZ.steps[0]||{},c=o.counters||{},f=o.found||{};box.innerHTML=`<p class="sub" style="margin:0">Файлы раздела: основные — DXF чертежей и XML сметы. PDF и OCR — позже.</p><div class="wkv"><span><b>${c.project_files||0}</b>файлов проекта</span><span><b>${c.estimate_files||0}</b>смет</span>${f.at?`<span>найдено новых объектов: <b>${f.new_project}</b></span><span>чужие сети: ${esc(Object.entries(f.other_nets||{}).map(([k,v])=>k+' — '+v).join(', ')||'нет')}</span>`:''}</div><div class="wact"><button class="btn" onclick="wizAnalyze()">Проанализировать файлы</button><button class="btn" onclick="showPage('files')">Файлы проекта →</button></div>`+foot;return}
+ if(WZ2sub==='1.0'){const o=WZ&&WZ.steps[0]||{},c=o.counters||{},f=o.found||{};box.innerHTML=`<p class="sub" style="margin:0">Файлы раздела: основные — DXF чертежей и XML сметы. PDF и OCR — позже.</p><div class="wkv"><span><b>${c.project_files||0}</b>файлов проекта</span><span><b>${c.estimate_files||0}</b>смет</span>${f.at?`<span>найдено новых объектов: <b>${f.new_project}</b></span><span>чужие сети: ${esc(Object.entries(f.other_nets||{}).map(([k,v])=>k+' — '+v).join(', ')||'нет')}</span>${Object.keys(f.list_other_nets||{}).length?`<span class="warnline">в перечне объекты чужих сетей: ${esc(Object.entries(f.list_other_nets).map(([k,v])=>k+' — '+v).join(', '))}</span>`:''}${Object.keys(f.dup_other_sections||{}).length?`<span class="warnline">те же шифры в других разделах (двойной счёт?): ${esc(Object.entries(f.dup_other_sections).map(([k,v])=>k+' — '+v).join(', '))}</span>`:''}`:''}</div><div class="wact"><button class="btn" onclick="wizAnalyze()">Проанализировать файлы</button><button class="btn" onclick="showPage('files')">Файлы проекта →</button></div>`+foot;return}
  if(WZ2sub==='1.1'){box.innerHTML=`<p class="sub" style="margin:0">Нормативы раздела: библиотека по умолчанию (редактируется) и ссылки, найденные в надписях чертежей DXF. Принятые нормативы пойдут в АОСР и в проверки замечаний.</p><div class="wact" style="margin:8px 0"><button class="btn primary" onclick="wz2Fill('norms')">Заполнить: библиотека + DXF</button><button class="btn" onclick="wz2NormLib()">Библиотека нормативов…</button><button class="btn" onclick="wz2Journal(1,'layer:norm')">Откатить нормативы…</button></div>`+wz2TableShell()+foot;WZ2f.layer='norm';wz2Items();return}
  if(WZ2sub==='1.3'){box.innerHTML=`<p class="sub" style="margin:0">Ведомость материалов проекта: трубы — по длинам участков перечня (тип и диаметр из описания), изделия колодцев — из таблицы (ведомости) колодцев проекта, иначе по шаблону типа (кольца — по глубине из ведомости или профилей DXF, её можно поправить; колодцы без типа — по преобладающему типу сети), плюс упоминания в DXF. Количество можно поправить — ручная правка не перезаписывается при повторном заполнении.</p><div class="wact" style="margin:8px 0"><button class="btn primary" onclick="wz2Fill('materials')">Заполнить ведомость</button><button class="btn" onclick="WZ2sub='1.4';wizRender()">Сверить со сметой →</button><button class="btn" onclick="wz2Depths()">Глубины колодцев…</button><button class="btn" onclick="wz2Journal(1,'layer:material')">Откатить материалы…</button></div>`+wz2TableShell()+foot;WZ2f.layer='material';wz2Items();return}
  if(WZ2sub==='1.4'){box.innerHTML=`<p class="sub" style="margin:0">Замечания к проекту — справка для собственных нужд (не письмо). Сверка материалов проект–смета (вариант А): по ведомости 1.3, в единицах проекта, с учётом потерь; расхождение больше порога становится замечанием. Трудоёмкость — в чел.-ч по ГЭСН или по своей норме.</p><div class="wact" style="margin:8px 0"><button class="btn primary" onclick="wz2Compare(false)">Сверить материалы со сметой</button><button class="btn" onclick="wz2Params()">Порог и потери…</button><button class="btn" onclick="wz2RemarkEdit()">+ замечание</button><button class="btn" onclick="wz2Labor()">Нормы трудоёмкости…</button><button class="btn" onclick="wz2ToGoogle()">Справка → в Google Таблицу</button><a class="btn" href="${scoped('/api/wz2/remarks/export.csv')}" target="_blank">CSV</a></div><div id="wz2Cmp"></div><h3 style="margin:14px 0 6px">Замечания</h3><div id="wz2Rem" class="loading">Загружаем…</div>`+foot;wz2Compare(true);wz2Remarks();return}
