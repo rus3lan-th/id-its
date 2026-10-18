@@ -54,9 +54,9 @@ def check(cond, msg):
 
 
 w = st("0. исходно (база до мастера)")
-check(w["steps"][0]["status"] == "done" and w["steps"][0]["derived"], "шаг 1 должен считаться готовым по уже существующему перечню")
-check(w["steps"][2]["status"] == "locked", "шаг 3 до подтверждения перечня должен быть недоступен")
-call("POST", "/api/wizard/match", expect=409)
+# v.90: при миграции в мастер 2.0 прежний перечень считается подтверждённым (шаги 1–2) — автосопоставление доступно сразу
+check(w["steps"][0]["status"] == "done" and w["steps"][1]["status"] == "done", "шаги 1–2 подтверждены миграцией (перечень был до мастера)")
+check(w["steps"][2]["status"] == "work" and w["steps"][3]["status"] == "locked", "шаг 3 доступен, шаг 4 — только после сопоставления")
 call("POST", "/api/wizard/step", {"step": 4}, expect=409)
 
 an = call("POST", "/api/wizard/analyze")

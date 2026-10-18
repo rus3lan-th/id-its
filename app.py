@@ -36,7 +36,7 @@ from pydantic import BaseModel, Field
 
 DB_PATH = Path(os.getenv("APP_DB_PATH", "/data/id_nvk.sqlite3"))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-app = FastAPI(title="ИД ИТС · НВК", version="2026.10.18.89")
+app = FastAPI(title="ИД ИТС · НВК", version="2026.10.18.90")
 
 
 # ---------- Доступ: логин и пароль (HTTP Basic), пароль хранится только в виде хеша ----------
@@ -3694,6 +3694,10 @@ def backup_full(request: Request) -> StreamingResponse:
 
 # ---------------------------------------------------------------- Что нового (окно после обновления программы)
 RELEASE_NOTES: list[tuple[str, list[str]]] = [
+    ("2026.10.18.90", ["Мастер «Перечень работ» 2.0 (каркас): шаг 1 с подшагами (источники, нормативы, виды работ и объёмы, материалы, замечания), шаг 2 — группы работ, задаваемые пользователем (колодец, узел, секция, щит).",
+                       "Рабочий перечень отделён от перечня прораба: изменения попадают к прорабу только при подтверждении шага. Массовые действия: принять, отклонить, «не делаем», «другой подрядчик», перенести в группу.",
+                       "Снимки при каждом подтверждении и перед каждым откатом. Откат шага целиком или частично (выделенные пункты, группа, файл-источник) с обязательной причиной; если затронуты отметки прораба — нужно подтверждение, отметки сохраняются в истории.",
+                       "Существующие разделы перенесены автоматически: объекты, работы и участки — как подтверждённые шаги 1–2, перечень у прораба не меняется."]),
     ("2026.10.18.89", ["Объекты «Не делаем» и «Другой подрядчик» не учитываются в процентах выполнения на «Обзоре», в графике и в прогрессе исполнительных схем.",
                        "Прораб видит и отмечает перечень раздела только после того, как ПТО нажал «Завершить» на шаге 4 мастера; до этого — сообщение «Перечень готовит ПТО».",
                        "Разделы, где перечень был составлен до мастера, считаются уже переданными прорабу — работа на объекте не останавливается."]),
@@ -5901,12 +5905,647 @@ def element_edit(request: Request, element_id: str, p: ElementEdit) -> dict[str,
         if not upd:
             return {"message": "Без изменений"}
         c.execute("UPDATE elements SET " + ",".join(f"{k}=?" for k in upd) + " WHERE id=?", (*upd.values(), element_id))
+        wz = {k: upd[k] for k in ("name", "kind", "scope") if k in upd} | ({"key": upd["code"]} if "code" in upd else {}) | ({"note": upd["planned_note"]} if "planned_note" in upd else {})
+        if wz:   # мастер 2.0: правка через прежнюю форму отражается в рабочем перечне
+            c.execute("UPDATE wz_items SET " + ",".join(f"{k}=?" for k in wz) + " WHERE element_id=? AND layer='object'", (*wz.values(), element_id))
         unl = 0
         if upd.get("scope") in ("excluded", "other"):
             unl = c.execute("DELETE FROM work_alloc WHERE element_id=?", (element_id,)).rowcount
         audit(request, c, "element", element_id, "edit", f"Перечень: {el['code']} — " + ", ".join(f"{k}: {upd[k]}" for k in upd if k not in ("scope_by", "scope_at"))[:250],
               {k: [el[k] if k in el.keys() else "", v] for k, v in upd.items()}, section_id=el["section_id"])
         return {"message": "Сохранено" + (f"; снято привязок сметы: {unl}" if unl else ""), "unlinked": unl}
+
+
+# ================================================================ v.90: мастер 2.0 — каркас (Ф0): рабочий перечень, снимки, откат
+_WZ2_DDL = """
+CREATE TABLE IF NOT EXISTS wz_items (
+  id TEXT PRIMARY KEY, section_id TEXT NOT NULL, layer TEXT NOT NULL, key TEXT NOT NULL, parent_id TEXT NOT NULL DEFAULT '',
+  name TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL DEFAULT '', unit TEXT NOT NULL DEFAULT '', qty REAL, note TEXT NOT NULL DEFAULT '',
+  data_json TEXT NOT NULL DEFAULT '{}', source_file_id TEXT NOT NULL DEFAULT '', locator TEXT NOT NULL DEFAULT '',
+  origin TEXT NOT NULL DEFAULT 'manual', state TEXT NOT NULL DEFAULT 'accepted', scope TEXT NOT NULL DEFAULT '',
+  element_id TEXT NOT NULL DEFAULT '', operation_id TEXT NOT NULL DEFAULT '', sort INTEGER NOT NULL DEFAULT 0, run_id TEXT NOT NULL DEFAULT '',
+  updated_by TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS ix_wz_items_sec ON wz_items (section_id, layer);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_wz_items_key ON wz_items (section_id, layer, key);
+CREATE TABLE IF NOT EXISTS wz_history (
+  id TEXT PRIMARY KEY, section_id TEXT NOT NULL, item_id TEXT NOT NULL, item_kind TEXT NOT NULL DEFAULT 'item', action TEXT NOT NULL,
+  before_json TEXT NOT NULL DEFAULT '', after_json TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '', by TEXT NOT NULL DEFAULT '', at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_wz_hist ON wz_history (section_id, item_id, at);
+CREATE TABLE IF NOT EXISTS wz_snapshots (
+  id TEXT PRIMARY KEY, section_id TEXT NOT NULL, step INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'confirm', reason TEXT NOT NULL DEFAULT '',
+  stats_json TEXT NOT NULL DEFAULT '{}', data BLOB, by TEXT NOT NULL DEFAULT '', at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_wz_snap ON wz_snapshots (section_id, step, at);
+CREATE TABLE IF NOT EXISTS wz_groups (
+  id TEXT PRIMARY KEY, section_id TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'group', parent_id TEXT NOT NULL DEFAULT '',
+  sort INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '', origin TEXT NOT NULL DEFAULT 'manual', updated_by TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS wz_group_members (group_id TEXT NOT NULL, item_id TEXT NOT NULL, sort INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (group_id, item_id));
+CREATE TABLE IF NOT EXISTS wz_state (
+  section_id TEXT NOT NULL, step TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'todo', fp TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '',
+  confirmed_at TEXT NOT NULL DEFAULT '', confirmed_by TEXT NOT NULL DEFAULT '', snapshot_id TEXT NOT NULL DEFAULT '', PRIMARY KEY (section_id, step)
+);
+"""
+WZ2_STEPS = [("1", "Перечень работ по проекту"), ("2", "Укрупнённый состав"), ("3", "Сопоставление со сметой"), ("4", "Ручное сопоставление")]
+WZ2_SUB = [("1.0", "Источники", "Ф0"), ("1.1", "Нормативы", "Ф1"), ("1.2", "Виды работ и объёмы", "Ф0"), ("1.3", "Материалы", "Ф2"), ("1.4", "Замечания", "Ф3")]
+_WZ_ITEM_COLS = ("id", "section_id", "layer", "key", "parent_id", "name", "kind", "unit", "qty", "note", "data_json", "source_file_id", "locator", "origin", "state", "scope",
+                 "element_id", "operation_id", "sort", "run_id", "updated_by", "updated_at")
+_WZ_GROUP_COLS = ("id", "section_id", "name", "kind", "parent_id", "sort", "note", "origin", "updated_by", "updated_at")
+_WZ_EDITABLE = ("name", "kind", "unit", "qty", "note", "state", "scope", "key")
+
+
+def _init_wz2(c: sqlite3.Connection) -> None:
+    c.executescript(_WZ2_DDL)
+    for sid in [r[0] for r in c.execute("SELECT DISTINCT section_id FROM elements WHERE section_id IS NOT NULL")]:
+        _wz2_migrate(c, sid)
+
+
+def _wz2_migrate(c: sqlite3.Connection, sid: str, who: str = "миграция v.90") -> bool:
+    """Идемпотентно: перенос опубликованного перечня (elements/operations/block) в рабочий перечень мастера 2.0 + снимок «Миграция»."""
+    if c.execute("SELECT 1 FROM wz_state WHERE section_id=? AND step='migrated'", (sid,)).fetchone():
+        return False
+    t = now()
+    els = c.execute("SELECT * FROM elements WHERE section_id=? AND enabled=1 ORDER BY block, created_at, code", (sid,)).fetchall()
+    gid_by_block: dict[str, str] = {}
+    for i, e in enumerate(els):
+        oid = str(uuid.uuid4())
+        c.execute("INSERT INTO wz_items (id,section_id,layer,key,name,kind,note,origin,state,scope,element_id,sort,updated_by,updated_at,data_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (oid, sid, "object", e["code"], e["name"], e["kind"], e["planned_note"] or "", "legacy", "accepted", e["scope"] or "", e["id"], i, who, t,
+                   json.dumps({"weight": e["weight"], "source": e["source"]}, ensure_ascii=False)))
+        for o in c.execute("SELECT * FROM operations WHERE element_id=? ORDER BY sort_order", (e["id"],)).fetchall():
+            c.execute("INSERT INTO wz_items (id,section_id,layer,key,parent_id,name,kind,origin,state,element_id,operation_id,sort,updated_by,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                      (str(uuid.uuid4()), sid, "work", e["code"] + "/" + o["code"], oid, o["title"], o["code"], "legacy", "accepted", e["id"], o["id"], o["sort_order"], who, t))
+        b = (e["block"] or "").strip()
+        if b:
+            if b not in gid_by_block:
+                gid_by_block[b] = str(uuid.uuid4())
+                c.execute("INSERT INTO wz_groups (id,section_id,name,kind,sort,origin,updated_by,updated_at) VALUES (?,?,?,?,?,?,?,?)", (gid_by_block[b], sid, b, "group", len(gid_by_block), "legacy", who, t))
+            c.execute("INSERT OR IGNORE INTO wz_group_members (group_id,item_id,sort) VALUES (?,?,?)", (gid_by_block[b], oid, i))
+    lw = c.execute("SELECT * FROM list_wizard WHERE section_id=?", (sid,)).fetchone()
+    s1 = "done" if els else "todo"
+    for st, status, note in (("1", s1, "перенесено из прежнего перечня" if els else ""), ("1.0", s1, ""), ("1.1", "todo", ""), ("1.2", s1, ""), ("1.3", "todo", ""), ("1.4", "todo", ""),
+                             ("2", "done" if gid_by_block else "todo", "участки перенесены из прежнего перечня" if gid_by_block else "")):
+        c.execute("INSERT OR REPLACE INTO wz_state (section_id,step,status,note,confirmed_at,confirmed_by) VALUES (?,?,?,?,?,?)", (sid, st, status, note, t if status == "done" else "", who if status == "done" else ""))
+    snap1 = _wz2_snapshot(c, sid, 1, "migration", "Миграция в мастер 2.0", who)
+    snap2 = _wz2_snapshot(c, sid, 2, "migration", "Миграция в мастер 2.0", who)
+    c.execute("UPDATE wz_state SET fp=?, snapshot_id=? WHERE section_id=? AND step='1'", (_wz2_fp(c, sid, 1), snap1, sid))
+    c.execute("UPDATE wz_state SET fp=?, snapshot_id=? WHERE section_id=? AND step='2'", (_wz2_fp(c, sid, 2), snap2, sid))
+    if els and not (lw and lw["s2_at"]):   # прежний перечень считается подтверждённым — автосопоставление доступно сразу
+        _wiz_set(c, sid, s1_at=t, s1_by=who, s2_at=t, s2_by=who, s2_fp=_list_fp(c, sid))
+    c.execute("INSERT OR REPLACE INTO wz_state (section_id,step,status,note,confirmed_at,confirmed_by) VALUES (?,?,?,?,?,?)",
+              (sid, "migrated", "done", json.dumps({"objects": len(els), "groups": len(gid_by_block), "had_wizard": bool(lw)}, ensure_ascii=False), t, who))
+    return True
+
+
+def _wz2_adopt(c: sqlite3.Connection, sid: str, who: str = "прежний перечень") -> int:
+    """Объекты и работы, добавленные в перечень прежними способами (вручную, из проекта, наборы), — в рабочий перечень, чтобы публикация их не выключила."""
+    n = 0
+    known_el = {r[0]: r[1] for r in c.execute("SELECT element_id, id FROM wz_items WHERE section_id=? AND layer='object' AND element_id<>''", (sid,))}
+    known_op = {r[0] for r in c.execute("SELECT operation_id FROM wz_items WHERE section_id=? AND layer='work' AND operation_id<>''", (sid,))}
+    for e in c.execute("SELECT * FROM elements WHERE section_id=? AND enabled=1", (sid,)).fetchall():
+        oid = known_el.get(e["id"])
+        if not oid:
+            ex = c.execute("SELECT id FROM wz_items WHERE section_id=? AND layer='object' AND key=?", (sid, e["code"])).fetchone()
+            if ex:
+                oid = ex[0]
+                c.execute("UPDATE wz_items SET element_id=? WHERE id=?", (e["id"], oid))
+            else:
+                oid = str(uuid.uuid4())
+                c.execute("INSERT INTO wz_items (id,section_id,layer,key,name,kind,note,origin,state,scope,element_id,sort,updated_by,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                          (oid, sid, "object", e["code"], e["name"], e["kind"], e["planned_note"] or "", "legacy", "accepted", e["scope"] or "", e["id"], 9000, who, now()))
+                _wz2_hist(c, sid, oid, "adopt", None, {"key": e["code"], "name": e["name"]}, who)
+                n += 1
+        for o in c.execute("SELECT * FROM operations WHERE element_id=?", (e["id"],)).fetchall():
+            if o["id"] in known_op:
+                continue
+            key = e["code"] + "/" + o["code"]
+            ex = c.execute("SELECT id FROM wz_items WHERE section_id=? AND layer='work' AND key=?", (sid, key)).fetchone()
+            if ex:
+                c.execute("UPDATE wz_items SET operation_id=?, element_id=?, parent_id=? WHERE id=?", (o["id"], e["id"], oid, ex[0]))
+            else:
+                c.execute("INSERT INTO wz_items (id,section_id,layer,key,parent_id,name,kind,origin,state,element_id,operation_id,sort,updated_by,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                          (str(uuid.uuid4()), sid, "work", key, oid, o["title"], o["code"], "legacy", "accepted", e["id"], o["id"], o["sort_order"], who, now()))
+                n += 1
+    return n
+
+
+def _wz2_rows(c: sqlite3.Connection, sid: str, step: int) -> dict[str, Any]:
+    if step == 1:
+        return {"items": [dict(r) for r in c.execute("SELECT * FROM wz_items WHERE section_id=? ORDER BY layer, sort, key", (sid,))]}
+    return {"groups": [dict(r) for r in c.execute("SELECT * FROM wz_groups WHERE section_id=? ORDER BY sort, name", (sid,))],
+            "members": [dict(r) for r in c.execute("SELECT m.* FROM wz_group_members m JOIN wz_groups g ON g.id=m.group_id WHERE g.section_id=? ORDER BY m.group_id, m.sort", (sid,))]}
+
+
+def _wz2_fp(c: sqlite3.Connection, sid: str, step: int) -> str:
+    d = _wz2_rows(c, sid, step)
+    if step == 1:
+        payload = [(r["id"], r["key"], r["parent_id"], r["name"], r["kind"], r["unit"], r["qty"], r["note"], r["state"], r["scope"]) for r in d["items"]]
+    else:
+        payload = [(g["id"], g["name"], g["kind"], g["parent_id"], g["sort"]) for g in d["groups"]] + [(m["group_id"], m["item_id"]) for m in d["members"]]
+    return hashlib.sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _wz2_stats(c: sqlite3.Connection, sid: str, step: int) -> dict[str, Any]:
+    if step == 1:
+        r = {f"{a}_{b}": n for a, b, n in c.execute("SELECT layer, state, COUNT(*) FROM wz_items WHERE section_id=? GROUP BY 1,2", (sid,))}
+        r["objects"] = sum(v for k, v in r.items() if k.startswith("object_") and not k.endswith("rejected"))
+        r["works"] = sum(v for k, v in r.items() if k.startswith("work_") and not k.endswith("rejected"))
+        return r
+    return {"groups": c.execute("SELECT COUNT(*) FROM wz_groups WHERE section_id=?", (sid,)).fetchone()[0],
+            "members": c.execute("SELECT COUNT(*) FROM wz_group_members m JOIN wz_groups g ON g.id=m.group_id WHERE g.section_id=?", (sid,)).fetchone()[0]}
+
+
+def _wz2_snapshot(c: sqlite3.Connection, sid: str, step: int, kind: str, reason: str, who: str) -> str:
+    snap = str(uuid.uuid4())
+    data = gzip.compress(json.dumps(_wz2_rows(c, sid, step), ensure_ascii=False, default=str).encode("utf-8"))
+    c.execute("INSERT INTO wz_snapshots (id,section_id,step,kind,reason,stats_json,data,by,at) VALUES (?,?,?,?,?,?,?,?,?)",
+              (snap, sid, step, kind, reason[:300], json.dumps(_wz2_stats(c, sid, step), ensure_ascii=False), data, who, now()))
+    return snap
+
+
+def _wz2_load_snap(c: sqlite3.Connection, sid: str, snap_id: str) -> tuple[sqlite3.Row, dict[str, Any]]:
+    r = c.execute("SELECT * FROM wz_snapshots WHERE id=? AND section_id=?", (snap_id, sid)).fetchone()
+    if not r:
+        raise HTTPException(404, "Снимок не найден")
+    return r, json.loads(gzip.decompress(r["data"]).decode("utf-8"))
+
+
+def _wz2_hist(c: sqlite3.Connection, sid: str, iid: str, action: str, before: Any, after: Any, who: str, reason: str = "", kind: str = "item") -> None:
+    c.execute("INSERT INTO wz_history (id,section_id,item_id,item_kind,action,before_json,after_json,reason,by,at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+              (str(uuid.uuid4()), sid, iid, kind, action, json.dumps(before, ensure_ascii=False, default=str) if before is not None else "",
+               json.dumps(after, ensure_ascii=False, default=str) if after is not None else "", reason[:300], who, now()))
+
+
+def _wz2_put_item(c: sqlite3.Connection, row: dict[str, Any]) -> None:
+    c.execute("INSERT OR REPLACE INTO wz_items (" + ",".join(_WZ_ITEM_COLS) + ") VALUES (" + ",".join("?" * len(_WZ_ITEM_COLS)) + ")", tuple(row.get(k) for k in _WZ_ITEM_COLS))
+
+
+def _wz2_marks_for(c: sqlite3.Connection, element_ids: set[str], operation_ids: set[str]) -> dict[str, int]:
+    """Сколько отметок прораба и актов затронет изменение (объекты и операции опубликованного перечня)."""
+    ops = set(operation_ids)
+    for eid in element_ids:
+        ops |= {r[0] for r in c.execute("SELECT id FROM operations WHERE element_id=?", (eid,))}
+    if not ops:
+        return {"marks": 0, "acts": 0, "operations": 0}
+    q = ",".join("?" * len(ops))
+    return {"marks": c.execute(f"SELECT COUNT(*) FROM events WHERE operation_id IN ({q})", tuple(ops)).fetchone()[0],
+            "acts": c.execute(f"SELECT COUNT(DISTINCT doc_id) FROM act_ops WHERE operation_id IN ({q})", tuple(ops)).fetchone()[0], "operations": len(ops)}
+
+
+def _wz2_plan(c: sqlite3.Connection, sid: str, target: list[dict[str, Any]], ids: Optional[set[str]]) -> dict[str, Any]:
+    """Разница «текущий рабочий перечень → целевой» (по всем пунктам или только по ids) и затронутые отметки прораба."""
+    cur = {r["id"]: dict(r) for r in c.execute("SELECT * FROM wz_items WHERE section_id=?", (sid,))}
+    tgt = {r["id"]: r for r in target}
+    scope_ids = set(cur) | set(tgt) if ids is None else ids
+    add = [i for i in scope_ids if i in tgt and i not in cur]
+    rem = [i for i in scope_ids if i in cur and i not in tgt]
+    chg = [i for i in scope_ids if i in cur and i in tgt and any(str(cur[i].get(k)) != str(tgt[i].get(k)) for k in _WZ_EDITABLE + ("parent_id",))]
+    # отметки затрагиваются, если объект/работа уходит из перечня или выключается
+    gone = [cur[i] for i in rem] + [tgt[i] for i in chg if tgt[i]["state"] in ("rejected",) or tgt[i]["scope"] in ("excluded", "other")]
+    marks = _wz2_marks_for(c, {g["element_id"] for g in gone if g["layer"] == "object" and g["element_id"]}, {g["operation_id"] for g in gone if g["layer"] == "work" and g["operation_id"]})
+    return {"add": add, "remove": rem, "change": chg, "counts": {"add": len(add), "remove": len(rem), "change": len(chg)}, **marks}
+
+
+def _wz2_apply(c: sqlite3.Connection, sid: str, target: list[dict[str, Any]], plan: dict[str, Any], who: str, reason: str) -> None:
+    tgt = {r["id"]: r for r in target}
+    for i in plan["remove"]:
+        b = dict(c.execute("SELECT * FROM wz_items WHERE id=?", (i,)).fetchone())
+        c.execute("DELETE FROM wz_items WHERE id=?", (i,))
+        c.execute("DELETE FROM wz_group_members WHERE item_id=?", (i,))
+        _wz2_hist(c, sid, i, "rollback-remove", b, None, who, reason)
+    for i in plan["add"] + plan["change"]:
+        b = c.execute("SELECT * FROM wz_items WHERE id=?", (i,)).fetchone()
+        c.execute("DELETE FROM wz_items WHERE section_id=? AND layer=? AND key=? AND id<>?", (sid, tgt[i]["layer"], tgt[i]["key"], i))  # ключ занят новым пунктом — уступает
+        _wz2_put_item(c, {**tgt[i], "updated_by": who, "updated_at": now()})
+        _wz2_hist(c, sid, i, "rollback-restore", dict(b) if b else None, tgt[i], who, reason)
+
+
+def _wz2_mark_downstream(c: sqlite3.Connection, sid: str, from_step: int, why: str) -> None:
+    for st in range(from_step, 3):
+        r = c.execute("SELECT status FROM wz_state WHERE section_id=? AND step=?", (sid, str(st))).fetchone()
+        if r and r[0] == "done":
+            c.execute("UPDATE wz_state SET status=?, note=? WHERE section_id=? AND step=?", ("work" if st == from_step else "stale", why[:200], sid, str(st)))
+        elif not r:
+            c.execute("INSERT INTO wz_state (section_id,step,status,note) VALUES (?,?,?,?)", (sid, str(st), "work", why[:200]))
+
+
+def _wz2_publish(c: sqlite3.Connection, sec: Any, who: str) -> dict[str, Any]:
+    """Рабочий перечень → опубликованный (elements/operations), который видят прораб и сопоставление. Ничего не удаляется с отметками:
+    объект, ушедший из перечня, выключается (enabled=0, история отметок остаётся); работа без отметок удаляется, с отметками — остаётся."""
+    sid = sec["id"]
+    _wz2_adopt(c, sid)
+    items = [dict(r) for r in c.execute("SELECT * FROM wz_items WHERE section_id=? ORDER BY layer DESC, sort", (sid,))]
+    objs = [i for i in items if i["layer"] == "object" and i["state"] != "rejected"]
+    grp = {r[0]: r[1] for r in c.execute("SELECT m.item_id, g.name FROM wz_group_members m JOIN wz_groups g ON g.id=m.group_id WHERE g.section_id=? ORDER BY g.sort", (sid,))}
+    res = collections.Counter()
+    keep_el: set[str] = set()
+    for o in objs:
+        blk = grp.get(o["id"], "")
+        eid = o["element_id"]
+        row = c.execute("SELECT * FROM elements WHERE id=?", (eid,)).fetchone() if eid else None
+        if not row:
+            row = c.execute("SELECT * FROM elements WHERE section_id=? AND code=?", (sid, o["key"])).fetchone()
+        if row:
+            eid = row["id"]
+            new = {"code": o["key"], "name": o["name"], "kind": o["kind"], "planned_note": o["note"], "scope": o["scope"], "enabled": 1}
+            if blk:
+                new["block"] = blk
+            diff = {k: v for k, v in new.items() if str(row[k] or "") != str(v or "")}
+            if diff:
+                c.execute("UPDATE elements SET " + ",".join(f"{k}=?" for k in diff) + " WHERE id=?", (*diff.values(), eid))
+                res["el_changed"] += 1
+        else:
+            eid = str(uuid.uuid4())
+            c.execute("INSERT INTO elements (id,section_id,code,name,kind,block,planned_note,enabled,created_at,source,scope) VALUES (?,?,?,?,?,?,?,1,?,?,?)",
+                      (eid, sid, o["key"], o["name"], o["kind"] or "Элемент", blk or "Часть 1", o["note"], now(), "manual", o["scope"]))
+            res["el_added"] += 1
+        if eid != o["element_id"]:
+            c.execute("UPDATE wz_items SET element_id=? WHERE id=?", (eid, o["id"]))
+        keep_el.add(eid)
+        works = [w for w in items if w["layer"] == "work" and w["parent_id"] == o["id"] and w["state"] != "rejected"]
+        keep_op: set[str] = set()
+        for n, w in enumerate(works, 1):
+            code = w["kind"] or w["key"].split("/")[-1]
+            op = c.execute("SELECT * FROM operations WHERE id=?", (w["operation_id"],)).fetchone() if w["operation_id"] else None
+            if not op:
+                op = c.execute("SELECT * FROM operations WHERE element_id=? AND code=?", (eid, code)).fetchone()
+            if op:
+                if op["title"] != w["name"] or op["sort_order"] != (w["sort"] or n):
+                    c.execute("UPDATE operations SET title=?, sort_order=? WHERE id=?", (w["name"], w["sort"] or n, op["id"]))
+                    res["op_changed"] += 1
+                opid = op["id"]
+            else:
+                opid = str(uuid.uuid4())
+                c.execute("INSERT INTO operations (id,element_id,code,title,sort_order) VALUES (?,?,?,?,?)", (opid, eid, code, w["name"], w["sort"] or n))
+                res["op_added"] += 1
+            if opid != w["operation_id"] or eid != w["element_id"]:
+                c.execute("UPDATE wz_items SET operation_id=?, element_id=? WHERE id=?", (opid, eid, w["id"]))
+            keep_op.add(opid)
+        for op in c.execute("SELECT id FROM operations WHERE element_id=?", (eid,)).fetchall():
+            if op["id"] not in keep_op:
+                if c.execute("SELECT 1 FROM events WHERE operation_id=? UNION SELECT 1 FROM act_ops WHERE operation_id=?", (op["id"], op["id"])).fetchone():
+                    res["op_kept_marked"] += 1
+                else:
+                    c.execute("DELETE FROM operations WHERE id=?", (op["id"],))
+                    res["op_removed"] += 1
+    for e in c.execute("SELECT id FROM elements WHERE section_id=? AND enabled=1", (sid,)).fetchall():
+        if e["id"] not in keep_el:
+            c.execute("UPDATE elements SET enabled=0 WHERE id=?", (e["id"],))
+            c.execute("DELETE FROM work_alloc WHERE element_id=?", (e["id"],))
+            res["el_disabled"] += 1
+    return dict(res)
+
+
+def _wz2_state(c: sqlite3.Connection, sec: Any) -> dict[str, Any]:
+    sid = sec["id"]
+    _wz2_migrate(c, sid)
+    if _wz2_adopt(c, sid):
+        c.execute("UPDATE wz_state SET status='work', note='в перечень добавлены объекты вне мастера' WHERE section_id=? AND step='1' AND status='done'", (sid,))
+    st = {r["step"]: dict(r) for r in c.execute("SELECT * FROM wz_state WHERE section_id=?", (sid,))}
+    def g(k: str) -> dict[str, Any]:
+        return st.get(k) or {"status": "todo", "note": "", "confirmed_at": "", "confirmed_by": "", "fp": ""}
+    s1, s2 = g("1"), g("2")
+    if s1["status"] == "done" and s1["fp"] != _wz2_fp(c, sid, 1):
+        s1 = {**s1, "status": "work", "note": "изменён после подтверждения"}
+    if s2["status"] == "done" and (s2["fp"] != _wz2_fp(c, sid, 2)):
+        s2 = {**s2, "status": "work", "note": "изменён после подтверждения"}
+    if s1["status"] != "done" and s2["status"] == "done":
+        s2 = {**s2, "status": "stale", "note": "шаг 1 изменён — проверьте состав"}
+    old = _wizard_state(c, sec)
+    o3, o4 = old["steps"][2], old["steps"][3]
+    up_ok = s1["status"] == "done" and s2["status"] == "done"
+    def lk(stt: str) -> str:
+        return stt if up_ok else ("stale" if stt in ("done", "stale") else "locked")
+    steps = [
+        {"n": 1, "title": WZ2_STEPS[0][1], "status": s1["status"] if s1["status"] != "todo" else "work", "note": s1["note"], "at": s1["confirmed_at"], "by": s1["confirmed_by"],
+         "stats": _wz2_stats(c, sid, 1), "sub": [{"id": k, "title": t, "phase": ph, **{x: g(k)[x] for x in ("status", "note")}} for k, t, ph in WZ2_SUB]},
+        {"n": 2, "title": WZ2_STEPS[1][1], "status": "locked" if s1["status"] != "done" and s2["status"] == "todo" else (s2["status"] if s2["status"] != "todo" else "work"),
+         "note": s2["note"], "at": s2["confirmed_at"], "by": s2["confirmed_by"], "stats": _wz2_stats(c, sid, 2)},
+        {"n": 3, "title": WZ2_STEPS[2][1], "status": lk(o3["status"]), "counters": o3.get("counters"), "at": o3.get("at"), "result": o3.get("result")},
+        {"n": 4, "title": WZ2_STEPS[3][1], "status": lk(o4["status"]), "counters": o4.get("counters"), "at": o4.get("at")},
+    ]
+    snaps = [dict(r) for r in c.execute("SELECT id,step,kind,reason,stats_json,by,at FROM wz_snapshots WHERE section_id=? ORDER BY at DESC LIMIT 60", (sid,))]
+    cur = next((s["n"] for s in steps if s["status"] in ("work", "stale")), 4)
+    return {"section": sec["code"], "steps": steps, "current": cur, "snapshots": snaps, "handed_to_foreman": old["handed_to_foreman"], "scopes": SCOPES}
+
+
+def _who(request: Request) -> str:
+    return (getattr(request.state, "user", "") or "")[:80] or "ПТО"
+
+
+@app.get("/api/wz2")
+def wz2_get(section: Optional[str] = None) -> dict[str, Any]:
+    with db() as c:
+        return _wz2_state(c, _section(c, section))
+
+
+@app.get("/api/wz2/items")
+def wz2_items(section: Optional[str] = None, layer: str = "", q: str = "", state: str = "", group: str = "") -> dict[str, Any]:
+    with db() as c:
+        sid = _section(c, section)["id"]
+        _wz2_migrate(c, sid)
+        _wz2_adopt(c, sid)
+        rows = [dict(r) for r in c.execute("SELECT * FROM wz_items WHERE section_id=? ORDER BY sort, key", (sid,))]
+        mem = {r[0]: r[1] for r in c.execute("SELECT m.item_id, g.id FROM wz_group_members m JOIN wz_groups g ON g.id=m.group_id WHERE g.section_id=?", (sid,))}
+        objs = {r["id"]: r for r in rows if r["layer"] == "object"}
+        marks = {r[0]: r[1] for r in c.execute("SELECT o.id, COUNT(e.id) FROM operations o JOIN elements el ON el.id=o.element_id JOIN events e ON e.operation_id=o.id WHERE el.section_id=? GROUP BY o.id", (sid,))}
+        for r in rows:
+            r["group_id"] = mem.get(r["id"]) or mem.get(r["parent_id"], "")
+            r["marks"] = marks.get(r["operation_id"], 0) if r["layer"] == "work" else sum(marks.get(w["operation_id"], 0) for w in rows if w["parent_id"] == r["id"])
+            r["parent_key"] = objs[r["parent_id"]]["key"] if r["parent_id"] in objs else ""
+        ql = q.lower()
+        out = [r for r in rows if (not layer or r["layer"] == layer) and (not state or r["state"] == state or (state == "excluded" and r["scope"]))
+               and (not group or r["group_id"] == group) and (not ql or ql in (r["key"] + " " + r["name"] + " " + r["parent_key"]).lower())]
+        return {"items": out, "total": len(rows)}
+
+
+class Wz2ItemIn(BaseModel):
+    layer: Literal["object", "work", "material", "norm", "source"] = "work"
+    key: Optional[str] = Field(default=None, max_length=160)
+    parent_id: Optional[str] = Field(default=None, max_length=64)
+    name: Optional[str] = Field(default=None, max_length=300)
+    kind: Optional[str] = Field(default=None, max_length=80)
+    unit: Optional[str] = Field(default=None, max_length=20)
+    qty: Optional[float] = None
+    note: Optional[str] = Field(default=None, max_length=2000)
+    state: Optional[Literal["proposed", "accepted", "edited", "rejected"]] = None
+    scope: Optional[Literal["", "excluded", "other"]] = None
+
+
+@app.post("/api/wz2/items", status_code=201)
+def wz2_item_add(request: Request, p: Wz2ItemIn, section: Optional[str] = None) -> dict[str, Any]:
+    who = _who(request)
+    with db() as c:
+        sid = _section(c, section)["id"]
+        if not (p.key or "").strip() or not (p.name or "").strip():
+            raise HTTPException(422, "Укажите шифр и наименование")
+        key = p.key.strip()
+        if p.layer == "work" and p.parent_id:
+            par = c.execute("SELECT key FROM wz_items WHERE id=? AND section_id=?", (p.parent_id, sid)).fetchone()
+            if not par:
+                raise HTTPException(404, "Объект не найден")
+            key = par[0] + "/" + key if "/" not in key else key
+        if c.execute("SELECT 1 FROM wz_items WHERE section_id=? AND layer=? AND key=?", (sid, p.layer, key)).fetchone():
+            raise HTTPException(409, "Пункт с таким шифром уже есть")
+        row = {k: "" for k in _WZ_ITEM_COLS} | {"id": str(uuid.uuid4()), "section_id": sid, "layer": p.layer, "key": key, "parent_id": p.parent_id or "", "name": p.name.strip(),
+               "kind": p.kind or "", "unit": p.unit or "", "qty": p.qty, "note": p.note or "", "data_json": "{}", "origin": "manual", "state": "accepted", "scope": p.scope or "",
+               "sort": 999, "updated_by": who, "updated_at": now()}
+        _wz2_put_item(c, row)
+        _wz2_hist(c, sid, row["id"], "add", None, row, who)
+        return {"id": row["id"], "message": "Пункт добавлен"}
+
+
+@app.put("/api/wz2/items/{item_id}")
+def wz2_item_edit(request: Request, item_id: str, p: Wz2ItemIn) -> dict[str, Any]:
+    who = _who(request)
+    with db() as c:
+        r = c.execute("SELECT * FROM wz_items WHERE id=?", (item_id,)).fetchone()
+        if not r:
+            raise HTTPException(404, "Пункт не найден")
+        b = dict(r)
+        upd = {k: getattr(p, k) for k in _WZ_EDITABLE if getattr(p, k, None) is not None and getattr(p, k) != b[k]}
+        if not upd:
+            return {"message": "Без изменений"}
+        if "state" not in upd and b["state"] in ("proposed", "accepted") and b["origin"] != "manual":
+            upd["state"] = "edited"
+        upd |= {"updated_by": who, "updated_at": now()}
+        c.execute("UPDATE wz_items SET " + ",".join(f"{k}=?" for k in upd) + " WHERE id=?", (*upd.values(), item_id))
+        _wz2_hist(c, b["section_id"], item_id, "edit", b, {**b, **upd}, who)
+        return {"message": "Сохранено"}
+
+
+class Wz2Bulk(BaseModel):
+    ids: list[str] = Field(min_length=1, max_length=5000)
+    state: Optional[Literal["proposed", "accepted", "edited", "rejected"]] = None
+    scope: Optional[Literal["", "excluded", "other"]] = None
+    group_id: Optional[str] = None
+
+
+@app.post("/api/wz2/items/bulk")
+def wz2_bulk(request: Request, p: Wz2Bulk, section: Optional[str] = None) -> dict[str, Any]:
+    """Массовые действия: принять / отклонить / статус объёма / перенести в группу."""
+    who = _who(request)
+    n = 0
+    with db() as c:
+        sid = _section(c, section)["id"]
+        if p.group_id is not None and p.group_id and not c.execute("SELECT 1 FROM wz_groups WHERE id=? AND section_id=?", (p.group_id, sid)).fetchone():
+            raise HTTPException(404, "Группа не найдена")
+        for iid in p.ids:
+            r = c.execute("SELECT * FROM wz_items WHERE id=? AND section_id=?", (iid, sid)).fetchone()
+            if not r:
+                continue
+            b = dict(r)
+            upd = {k: v for k, v in (("state", p.state), ("scope", p.scope)) if v is not None and v != b[k]}
+            if upd:
+                c.execute("UPDATE wz_items SET " + ",".join(f"{k}=?" for k in upd) + ", updated_by=?, updated_at=? WHERE id=?", (*upd.values(), who, now(), iid))
+                _wz2_hist(c, sid, iid, "bulk", b, {**b, **upd}, who)
+                n += 1
+            if p.group_id is not None:
+                old = c.execute("SELECT group_id FROM wz_group_members WHERE item_id=?", (iid,)).fetchone()
+                c.execute("DELETE FROM wz_group_members WHERE item_id=?", (iid,))
+                if p.group_id:
+                    c.execute("INSERT OR IGNORE INTO wz_group_members (group_id,item_id,sort) VALUES (?,?,?)", (p.group_id, iid, b["sort"]))
+                _wz2_hist(c, sid, iid, "group", {"group_id": old[0] if old else ""}, {"group_id": p.group_id}, who, kind="member")
+                n += 1
+        return {"changed": n, "message": f"Изменено: {n}"}
+
+
+class Wz2GroupIn(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    kind: str = Field(default="group", max_length=40)
+    parent_id: str = Field(default="", max_length=64)
+    note: str = Field(default="", max_length=500)
+
+
+@app.post("/api/wz2/groups", status_code=201)
+def wz2_group_add(request: Request, p: Wz2GroupIn, section: Optional[str] = None) -> dict[str, Any]:
+    with db() as c:
+        sid = _section(c, section)["id"]
+        gid = str(uuid.uuid4())
+        n = c.execute("SELECT COALESCE(MAX(sort),0)+1 FROM wz_groups WHERE section_id=?", (sid,)).fetchone()[0]
+        c.execute("INSERT INTO wz_groups (id,section_id,name,kind,parent_id,sort,note,origin,updated_by,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                  (gid, sid, p.name.strip(), p.kind, p.parent_id, n, p.note, "manual", _who(request), now()))
+        _wz2_hist(c, sid, gid, "add", None, p.model_dump(), _who(request), kind="group")
+        return {"id": gid, "message": "Группа создана"}
+
+
+@app.put("/api/wz2/groups/{gid}")
+def wz2_group_edit(request: Request, gid: str, p: Wz2GroupIn) -> dict[str, Any]:
+    with db() as c:
+        g = c.execute("SELECT * FROM wz_groups WHERE id=?", (gid,)).fetchone()
+        if not g:
+            raise HTTPException(404, "Группа не найдена")
+        c.execute("UPDATE wz_groups SET name=?, kind=?, parent_id=?, note=?, updated_by=?, updated_at=? WHERE id=?", (p.name.strip(), p.kind, p.parent_id, p.note, _who(request), now(), gid))
+        _wz2_hist(c, g["section_id"], gid, "edit", dict(g), p.model_dump(), _who(request), kind="group")
+        return {"message": "Сохранено"}
+
+
+@app.delete("/api/wz2/groups/{gid}")
+def wz2_group_del(request: Request, gid: str) -> dict[str, Any]:
+    with db() as c:
+        g = c.execute("SELECT * FROM wz_groups WHERE id=?", (gid,)).fetchone()
+        if not g:
+            raise HTTPException(404, "Группа не найдена")
+        n = c.execute("DELETE FROM wz_group_members WHERE group_id=?", (gid,)).rowcount
+        c.execute("DELETE FROM wz_groups WHERE id=?", (gid,))
+        _wz2_hist(c, g["section_id"], gid, "delete", dict(g), None, _who(request), kind="group")
+        return {"message": f"Группа удалена; пунктов без группы: {n}"}
+
+
+@app.get("/api/wz2/groups")
+def wz2_groups(section: Optional[str] = None) -> dict[str, Any]:
+    with db() as c:
+        sid = _section(c, section)["id"]
+        _wz2_migrate(c, sid)
+        gs = [dict(r) for r in c.execute("""SELECT g.*, (SELECT COUNT(*) FROM wz_group_members m WHERE m.group_id=g.id) members FROM wz_groups g WHERE g.section_id=? ORDER BY g.sort, g.name""", (sid,))]
+        free = c.execute("SELECT COUNT(*) FROM wz_items i WHERE i.section_id=? AND i.layer='object' AND i.state<>'rejected' AND i.id NOT IN (SELECT item_id FROM wz_group_members)", (sid,)).fetchone()[0]
+        return {"groups": gs, "ungrouped_objects": free}
+
+
+class Wz2Confirm(BaseModel):
+    step: Literal["1", "1.0", "1.1", "1.2", "1.3", "1.4", "2"]
+    action: Literal["done", "skip", "reopen"] = "done"
+
+
+@app.post("/api/wz2/confirm")
+def wz2_confirm(request: Request, p: Wz2Confirm, section: Optional[str] = None) -> dict[str, Any]:
+    """Подтвердить подшаг/шаг. Подтверждение шага 1 или 2 — снимок + публикация в перечень прораба и сопоставления; следующие шаги — «устарело»."""
+    who = _who(request)
+    with db() as c:
+        sec = _section(c, section)
+        sid = sec["id"]
+        _wz2_migrate(c, sid)
+        pub: dict[str, Any] = {}
+        if p.action == "reopen":
+            c.execute("INSERT OR REPLACE INTO wz_state (section_id,step,status,note) VALUES (?,?,?,?)", (sid, p.step, "work", "возвращён в работу"))
+        elif "." in p.step:
+            c.execute("INSERT OR REPLACE INTO wz_state (section_id,step,status,note,confirmed_at,confirmed_by) VALUES (?,?,?,?,?,?)",
+                      (sid, p.step, "done" if p.action == "done" else "skipped", "" if p.action == "done" else "пропущено", now(), who))
+        else:
+            n = int(p.step)
+            if n == 2:
+                s1 = _wz2_state(c, sec)["steps"][0]
+                if s1["status"] != "done":
+                    raise HTTPException(409, "Сначала подтвердите шаг 1")
+            snap = _wz2_snapshot(c, sid, n, "confirm", f"Подтверждён шаг {n}", who)
+            c.execute("INSERT OR REPLACE INTO wz_state (section_id,step,status,note,confirmed_at,confirmed_by,fp,snapshot_id) VALUES (?,?,?,?,?,?,?,?)",
+                      (sid, p.step, "done", "", now(), who, _wz2_fp(c, sid, n), snap))
+            if n == 1:
+                for k, _t, _ph in WZ2_SUB:
+                    c.execute("INSERT OR IGNORE INTO wz_state (section_id,step,status) VALUES (?,?,?)", (sid, k, "todo"))
+            pub = _wz2_publish(c, sec, who)
+            if n == 2:   # прежний мастер: «перечень подтверждён» — открывает автосопоставление
+                _wiz_set(c, sid, s1_at=now(), s1_by=who, s2_at=now(), s2_by=who, s2_fp=_list_fp(c, sid))
+            else:
+                r2 = c.execute("SELECT status FROM wz_state WHERE section_id=? AND step='2'", (sid,)).fetchone()
+                if r2 and r2[0] == "done" and pub:
+                    c.execute("UPDATE wz_state SET status='stale', note='шаг 1 изменён — проверьте состав' WHERE section_id=? AND step='2'", (sid,))
+            audit(request, c, "wizard2", sid, f"confirm{n}", f"Мастер 2.0: подтверждён шаг {n}; публикация: {json.dumps(pub, ensure_ascii=False)}"[:300], section_id=sid)
+        return {"published": pub, "state": _wz2_state(c, sec)}
+
+
+class Wz2Rollback(BaseModel):
+    snapshot_id: str = Field(default="", max_length=64)
+    mode: Literal["full", "items", "group", "file"] = "full"
+    ids: list[str] = Field(default_factory=list, max_length=5000)
+    group_id: str = Field(default="", max_length=64)
+    file_id: str = Field(default="", max_length=64)
+    reason: str = Field(default="", max_length=300)
+    confirm_marks: bool = False
+    dry_run: bool = False
+
+
+@app.post("/api/wz2/rollback")
+def wz2_rollback(request: Request, p: Wz2Rollback, section: Optional[str] = None) -> dict[str, Any]:
+    """Откат шага 1/2 целиком к снимку или частично (пункты / группа / файл-источник). Перед откатом — снимок «перед откатом» (откат можно отменить).
+    Затронуты отметки прораба или акты — нужно подтверждение и причина; отметки не удаляются (история остаётся)."""
+    who = _who(request)
+    with db() as c:
+        sec = _section(c, section)
+        sid = sec["id"]
+        _wz2_migrate(c, sid)
+        if p.mode == "file":
+            if not p.file_id:
+                raise HTTPException(422, "Не указан файл-источник")
+            rows = [dict(r) for r in c.execute("SELECT * FROM wz_items WHERE section_id=? AND source_file_id=?", (sid, p.file_id))]
+            auto = [r for r in rows if r["origin"] == "auto" and r["state"] in ("proposed", "accepted")]
+            kept = [r for r in rows if r not in auto]
+            target = [r for r in (dict(x) for x in c.execute("SELECT * FROM wz_items WHERE section_id=?", (sid,))) if r["id"] not in {a["id"] for a in auto}]
+            plan = _wz2_plan(c, sid, target, {a["id"] for a in auto})
+            plan["kept_edited"] = len(kept)
+            step, snap_row = 1, None
+        else:
+            if not p.snapshot_id:
+                raise HTTPException(422, "Выберите снимок для отката")
+            snap_row, data = _wz2_load_snap(c, sid, p.snapshot_id)
+            step = snap_row["step"]
+            if step == 2:
+                cur_g = {r["id"] for r in c.execute("SELECT id FROM wz_groups WHERE section_id=?", (sid,))}
+                cur_m = {(r[0], r[1]) for r in c.execute("SELECT m.group_id, m.item_id FROM wz_group_members m JOIN wz_groups g ON g.id=m.group_id WHERE g.section_id=?", (sid,))}
+                tg = {g["id"] for g in data["groups"]}
+                tm = {(m["group_id"], m["item_id"]) for m in data["members"]}
+                if p.mode == "group":
+                    tm = {x for x in tm if x[0] == p.group_id} | {x for x in cur_m if x[0] != p.group_id}
+                    tg = (cur_g - {p.group_id}) | ({p.group_id} & tg)
+                plan = {"counts": {"groups_add": len(tg - cur_g), "groups_remove": len(cur_g - tg), "members_add": len(tm - cur_m), "members_remove": len(cur_m - tm)},
+                        "marks": 0, "acts": 0, "operations": 0}
+            else:
+                target = data["items"]
+                ids: Optional[set[str]] = None
+                if p.mode == "items":
+                    ids = set(p.ids)
+                    ids |= {r["id"] for r in target if r["parent_id"] in ids} | {r[0] for r in c.execute("SELECT id FROM wz_items WHERE section_id=? AND parent_id IN (%s)" % ",".join("?" * len(p.ids)), (sid, *p.ids))} if p.ids else set()
+                elif p.mode == "group":
+                    gm = {r[0] for r in c.execute("SELECT item_id FROM wz_group_members WHERE group_id=?", (p.group_id,))}
+                    ids = gm | {r["id"] for r in target if r["parent_id"] in gm} | {r[0] for r in c.execute("SELECT id FROM wz_items WHERE section_id=? AND parent_id IN (SELECT item_id FROM wz_group_members WHERE group_id=?)", (sid, p.group_id))}
+                if ids is not None:
+                    tmap = {r["id"]: r for r in target}
+                    cur = {r["id"]: dict(r) for r in c.execute("SELECT * FROM wz_items WHERE section_id=?", (sid,))}
+                    target = [tmap[i] if i in tmap else cur[i] for i in (set(cur) | set(tmap)) if (i in ids and i in tmap) or (i not in ids and i in cur)]
+                plan = _wz2_plan(c, sid, target, ids)
+        out = {"step": step, "mode": p.mode, "counts": plan["counts"], "marks": plan.get("marks", 0), "acts": plan.get("acts", 0), "kept_edited": plan.get("kept_edited", 0),
+               "snapshot": dict(snap_row) if snap_row is not None and False else (snap_row["at"] if snap_row is not None else "")}
+        if p.dry_run:
+            return {**out, "dry_run": True}
+        if len(p.reason.strip()) < 3:
+            raise HTTPException(422, "Укажите причину отката")
+        if (out["marks"] or out["acts"]) and not p.confirm_marks:
+            raise HTTPException(409, f"Откат затронет отметки прораба ({out['marks']}) и акты ({out['acts']}). Подтвердите: отметки сохранятся в истории, объекты уйдут из перечня после подтверждения шага.")
+        before = _wz2_snapshot(c, sid, step, "before-rollback", f"Перед откатом: {p.reason.strip()}", who)
+        if step == 2 and p.mode != "file":
+            if p.mode == "group":
+                c.execute("DELETE FROM wz_group_members WHERE group_id=?", (p.group_id,))
+                c.execute("DELETE FROM wz_groups WHERE id=?", (p.group_id,))
+                for g in data["groups"]:
+                    if g["id"] == p.group_id:
+                        c.execute("INSERT INTO wz_groups (" + ",".join(_WZ_GROUP_COLS) + ") VALUES (" + ",".join("?" * len(_WZ_GROUP_COLS)) + ")", tuple(g.get(k) for k in _WZ_GROUP_COLS))
+                for m in data["members"]:
+                    if m["group_id"] == p.group_id:
+                        c.execute("DELETE FROM wz_group_members WHERE item_id=?", (m["item_id"],))
+                        c.execute("INSERT OR IGNORE INTO wz_group_members (group_id,item_id,sort) VALUES (?,?,?)", (m["group_id"], m["item_id"], m["sort"]))
+            else:
+                c.execute("DELETE FROM wz_group_members WHERE group_id IN (SELECT id FROM wz_groups WHERE section_id=?)", (sid,))
+                c.execute("DELETE FROM wz_groups WHERE section_id=?", (sid,))
+                for g in data["groups"]:
+                    c.execute("INSERT INTO wz_groups (" + ",".join(_WZ_GROUP_COLS) + ") VALUES (" + ",".join("?" * len(_WZ_GROUP_COLS)) + ")", tuple(g.get(k) for k in _WZ_GROUP_COLS))
+                for m in data["members"]:
+                    c.execute("INSERT OR IGNORE INTO wz_group_members (group_id,item_id,sort) VALUES (?,?,?)", (m["group_id"], m["item_id"], m["sort"]))
+            _wz2_hist(c, sid, p.group_id or "*", "rollback", {"snapshot": before}, {"snapshot": p.snapshot_id}, who, p.reason, kind="groups")
+        else:
+            _wz2_apply(c, sid, target, plan, who, p.reason.strip())
+        _wz2_mark_downstream(c, sid, step, f"откат: {p.reason.strip()}")
+        audit(request, c, "wizard2", sid, "rollback", f"Мастер 2.0: откат шага {step} ({p.mode}); причина: {p.reason.strip()}; {json.dumps(out['counts'], ensure_ascii=False)}; отметок {out['marks']}"[:300], section_id=sid)
+        return {**out, "undo_snapshot": before, "message": "Откат выполнен. Проверьте и подтвердите шаг заново — изменения попадут к прорабу после подтверждения.", "state": _wz2_state(c, sec)}
+
+
+@app.get("/api/wz2/history")
+def wz2_history(section: Optional[str] = None, item: str = "", limit: int = 200) -> dict[str, Any]:
+    with db() as c:
+        sid = _section(c, section)["id"]
+        q = "SELECT id,item_id,item_kind,action,reason,by,at,before_json,after_json FROM wz_history WHERE section_id=?" + (" AND item_id=?" if item else "") + " ORDER BY at DESC LIMIT ?"
+        return {"history": [dict(r) for r in c.execute(q, (sid, item, min(limit, 1000)) if item else (sid, min(limit, 1000)))]}
 
 
 @app.get("/api/work-analysis")
@@ -7748,6 +8387,7 @@ PROP_STATUS = {"proposed": "предложено", "needs_check": "требуе�
 def _init_v76b(c: sqlite3.Connection) -> None:
     c.executescript(_V76B_DDL)
     _init_wizard(c)
+    _init_wz2(c)
     _ensure_cols(c, "work_instances", {"kind": "TEXT NOT NULL DEFAULT 'simple'", "axis_from": "TEXT NOT NULL DEFAULT '0'", "axis_len": "TEXT NOT NULL DEFAULT ''", "axis_unit": "TEXT NOT NULL DEFAULT 'м'",
                                        "rule_id": "TEXT NOT NULL DEFAULT ''", "blockers_json": "TEXT NOT NULL DEFAULT '[]'", "approval": "TEXT NOT NULL DEFAULT 'draft'",
                                        "approved_by": "TEXT NOT NULL DEFAULT ''", "approved_at": "TEXT NOT NULL DEFAULT ''", "note": "TEXT NOT NULL DEFAULT ''"})
@@ -12435,7 +13075,7 @@ HTML = r'''<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ИД ИТС</title>
 <script>try{if(/[?&]full=1/.test(location.search))sessionStorage.setItem("full","1");if(innerWidth<=620&&!sessionStorage.getItem("full"))location.replace("/m")}catch(e){}</script>
 <style>
-:root{--ink:#172a35;--muted:#72818a;--line:#e5ebed;--bg:#f5f8f8;--teal:#087f80;--teal2:#e1f3f1;--orange:#e8954a;--white:#fff;--shadow:0 8px 28px #1c33400b}*{box-sizing:border-box}body{margin:0;background:var(--bg);font:14px/1.45 Inter,system-ui,-apple-system,Segoe UI,sans-serif;color:var(--ink)}button,input,select,textarea{font:inherit}button{cursor:pointer}.app{display:grid;grid-template-columns:240px 1fr;min-height:100vh}.side{background:#112b36;color:#e8f0f1;padding:24px 16px;display:flex;flex-direction:column}.brand{padding:0 10px 30px;display:flex;gap:11px;align-items:center}.logo{width:34px;height:34px;border-radius:11px;background:linear-gradient(135deg,#20aaa0,#087f80);display:grid;place-items:center;color:white;font-weight:800}.brand strong{display:block;font-size:15px}.brand small{color:#9fb3b9}.navlabel{padding:14px 10px 8px;color:#81969d;text-transform:uppercase;font-size:10px;letter-spacing:1.3px}.nav button{border:0;background:transparent;color:#bdcbd0;padding:11px 12px;border-radius:9px;width:100%;text-align:left;display:flex;gap:12px;align-items:center;margin:2px 0}.nav button.active,.nav button:hover{background:#21444d;color:#fff}.nav i{font-style:normal;width:18px;text-align:center}.sidefoot{margin-top:auto;border-top:1px solid #29434b;padding:16px 10px 0;color:#9fb3b9;font-size:12px}.main{min-width:0}.top{height:72px;background:#fff;border-bottom:1px solid var(--line);padding:0 34px;display:flex;align-items:center;justify-content:space-between}.crumb{color:var(--muted);font-size:13px}.person{display:flex;align-items:center;gap:10px}.avatar{width:34px;height:34px;border-radius:50%;background:#e3f2ef;color:#087f80;display:grid;place-items:center;font-weight:700}.wrap{max-width:1400px;margin:auto;padding:28px 34px 60px}.heading{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:22px}.heading h1{font-size:25px;margin:0 0 4px;letter-spacing:-.5px}.sub{color:var(--muted)}.tag{border-radius:20px;background:#eef5f5;color:#49636b;padding:7px 11px;font-size:12px;display:inline-flex;align-items:center;gap:7px}.dot{height:7px;width:7px;border-radius:50%;background:#df9d48}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.card,.panel{background:var(--white);border:1px solid var(--line);border-radius:13px;box-shadow:var(--shadow)}.metric{padding:18px 20px}.metric-top{color:var(--muted);display:flex;justify-content:space-between;align-items:center}.metric-icon{font-size:18px;color:var(--teal);background:#edf8f6;border-radius:9px;width:34px;height:34px;display:grid;place-items:center}.metric strong{font-size:27px;display:block;margin:11px 0 3px}.metric small{color:var(--muted)}.section{margin-top:22px}.sectionhead{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}.sectionhead h2{font-size:16px;margin:0}.btn{border:1px solid var(--line);background:#fff;color:var(--ink);border-radius:8px;padding:9px 12px}.btn:hover{border-color:#91bcba}.btn.primary{background:var(--teal);color:white;border-color:var(--teal)}.btn.primary:hover{background:#086c6e}.btn.small{padding:6px 9px;font-size:12px}.filters{display:flex;gap:8px;align-items:center}.filters select,.filters input,.field input,.field textarea,.field select{border:1px solid var(--line);border-radius:8px;padding:9px 10px;background:#fff;color:var(--ink)}.filters input{width:210px}.tablewrap{overflow:auto}.table{width:100%;border-collapse:collapse;min-width:760px}.table th{text-align:left;color:var(--muted);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.45px;background:#fbfcfc;padding:12px 14px;border-bottom:1px solid var(--line)}.table td{padding:13px 14px;border-bottom:1px solid #eff2f2;vertical-align:middle}.table tr:last-child td{border:0}.code{font-weight:700}.kind{color:var(--muted);font-size:12px}.status{display:inline-flex;align-items:center;gap:6px;border-radius:20px;padding:5px 9px;font-size:11px;white-space:nowrap}.status.done{background:#e5f5ec;color:#29804c}.status.todo{background:#f2f4f4;color:#738187}.checkrow{display:flex;align-items:center;gap:9px}.checkrow input{accent-color:var(--teal);width:17px;height:17px}.personcell{font-size:12px;color:var(--muted)}.panel{padding:18px 20px}.notice{background:#fff6e9;border:1px solid #f6e2c8;border-radius:10px;padding:12px 14px;color:#7e5a32;margin:0 0 18px;font-size:12px}.hidden{display:none!important}.empty{padding:32px;text-align:center;color:var(--muted)}.cards2{display:grid;grid-template-columns:1fr 1fr;gap:14px}.timeline{border-left:2px solid #dce8e7;margin:8px 0 0 8px;padding-left:18px}.event{position:relative;padding:0 0 20px}.event:before{content:'';position:absolute;width:9px;height:9px;border-radius:50%;background:var(--teal);left:-24px;top:4px}.event strong{display:block}.event small{color:var(--muted)}.docsrow{display:flex;align-items:center;justify-content:space-between;padding:14px 0;border-bottom:1px solid var(--line)}.docsrow:last-child{border:0}.modal{position:fixed;inset:0;background:#12263077;display:grid;place-items:center;padding:18px;z-index:80}.dialog{background:white;border-radius:14px;padding:22px;width:min(520px,100%);max-height:94vh;overflow:auto;box-shadow:0 24px 70px #10252c44}.dialog h2{margin:0 0 16px;font-size:19px}.field{display:flex;flex-direction:column;gap:6px;margin:12px 0}.field label{font-size:12px;color:var(--muted)}.field textarea{min-height:82px;resize:vertical}.dialogactions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px;position:sticky;bottom:-22px;background:white;padding:10px 0 2px;z-index:2}.toast{position:fixed;bottom:22px;right:22px;background:#173c43;color:white;padding:12px 16px;border-radius:9px;box-shadow:var(--shadow);z-index:90}.loading{color:var(--muted);padding:28px}.pick{display:none;align-items:center}.deskcrumb{display:block;max-width:70%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.side{position:sticky;top:0;height:100vh;overflow:hidden}.objtree{overflow-y:auto;overflow-x:hidden;flex:1;min-height:0;margin:0 -4px 6px;padding:0 4px}.treefilter{width:100%;margin:0 0 6px;padding:7px 9px;border-radius:8px;border:1px solid #2c5560;background:#183a45;color:#e8f0f1;font-size:12px}.treefilter::placeholder{color:#7f959c}.archtoggle{width:100%;text-align:left;border:0;background:transparent;color:#81969d;font-size:12px;padding:8px 6px 4px}.archtoggle:hover{color:#fff}.obj.arch .nm{color:#8ea2a8;font-weight:500}.navs{margin-top:4px}.navlabel{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.navname{text-transform:none;letter-spacing:0;color:#b5c6cb;font-size:11px;margin-left:4px}.nav.second{margin-bottom:6px}.tabs{display:flex;gap:2px;align-items:flex-end;background:#fff;border-bottom:1px solid var(--line);padding:0 34px;overflow-x:auto;white-space:nowrap}.tabs .scope{align-self:center;margin-right:16px;font-size:10px;text-transform:uppercase;letter-spacing:1.2px;color:var(--muted);background:#f2f6f6;border-radius:6px;padding:4px 8px}.tabs button{border:0;background:transparent;padding:14px 14px 12px;color:#53666e;border-bottom:2px solid transparent;font-size:13.5px;display:flex;gap:7px;align-items:center;flex:none}.tabs button:hover{color:var(--ink)}.tabs button.active{color:var(--teal);border-bottom-color:var(--teal);font-weight:600}.bdg{font-size:11px;font-weight:700;border-radius:10px;padding:0 7px;background:#eef2f2;color:#72818a;line-height:18px}.bdg.warn{background:#fdecc8;color:#a86a12}.pbar{height:6px;background:#e8eeee;border-radius:4px;overflow:hidden;margin-top:5px}.pbar i{display:block;height:100%;background:var(--teal);transition:width .2s}.pbar.proc i{background:repeating-linear-gradient(45deg,#e1a24b,#e1a24b 8px,#efc27d 8px,#efc27d 16px);animation:mv 1s linear infinite;background-size:22px 22px}@keyframes mv{from{background-position:0 0}to{background-position:22px 0}}.uprow{padding:9px 0;border-bottom:1px solid var(--line);font-size:13px}.uprow .st{color:var(--muted);font-size:12px;margin-top:4px}.uprow.err .st{color:#b3541e;font-weight:600}.uprow.done .st{color:#29804c;font-weight:600}.srcblock{margin:0 0 16px}.linkrow{display:flex;gap:8px;margin:8px 0 4px}.linkrow input{flex:1;min-width:0;border:1px solid var(--line);border-radius:8px;padding:9px 10px}.hintbox{background:#f4f8f8;border:1px solid var(--line);border-radius:8px;padding:9px 11px;font-size:12px;color:#53666e;margin-top:8px}.chip{font-size:11px;border-radius:10px;padding:2px 8px;white-space:nowrap}.chip.new{background:#fdecc8;color:#a86a12}.chip.loaded{background:#e5f5ec;color:#29804c}.okline{color:#29804c;font-weight:600}.warnline{color:#b3541e;font-weight:600}.inboxlist{max-height:190px;overflow:auto;font-size:12px;margin:8px 0}.inboxlist div.r{display:flex;justify-content:space-between;gap:8px;padding:5px 0;border-bottom:1px solid #eef2f2}.inboxlist div.r span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}code{background:#eef3f3;border-radius:4px;padding:1px 5px;font-size:12px}.objhead.sel{background:#21444d;color:#fff}.crumb a{color:inherit;cursor:pointer;text-decoration:none}.crumb a:hover{color:var(--teal)}.obj{border-radius:9px;margin:3px 0}.sbedit{border:0;background:transparent;color:#9fb3b9;width:22px;flex:none;font-size:12px;padding:6px 0;opacity:0;transition:opacity .15s}.objline:hover .sbedit,.secline:hover .sbedit,.sbedit:focus{opacity:1}.sbedit:hover{color:#fff}.secline{position:relative;display:flex;align-items:center}.secline .secrow{flex:1;min-width:0}.objline{display:flex;align-items:flex-start}.chev{border:0;background:transparent;color:#9fb3b9;width:22px;padding:8px 0;font-size:12px;flex:none}.chev:hover{color:#fff}.secs{max-height:210px;overflow-y:auto;overflow-x:hidden;margin:0 0 4px}.objhead{flex:1;min-width:0;text-align:left;border:0;background:transparent;color:#d7e3e6;padding:8px 10px;border-radius:9px;display:flex;gap:8px;align-items:flex-start;line-height:1.3}.objhead:hover{background:#1c3c46}.objhead .nm{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;font-size:13px;font-weight:600;flex:1}.objhead .warn{color:#f0b35c;font-size:12px;font-weight:700}.obj.cur>.objhead{color:#fff}.secrow{width:100%;text-align:left;border:0;background:transparent;color:#9fb3b9;padding:6px 10px 6px 30px;font-size:12px;border-radius:8px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.secrow b{color:#d7e3e6;font-weight:700;margin-right:6px}.secrow.cur b{color:#fff}.secrow:hover{background:#1c3c46;color:#fff}.secrow.cur{background:#21444d;color:#fff;font-weight:600}.newobj{width:100%;margin:6px 0 4px;background:#183a45;border-color:#2c5560;color:#cfe2e5;font-size:12px}.newobj:hover{background:#21444d;border-color:#3a7480}.pick select{border:1px solid var(--line);border-radius:8px;padding:7px 9px;background:#fff;color:var(--ink);max-width:260px;font-weight:600}.dialog.wide{width:min(900px,100%);max-height:92vh;overflow:auto}.steps{display:flex;gap:8px;margin:0 0 14px}.steps span{flex:1;padding:7px 10px;border-radius:8px;background:#f2f4f4;color:#738187;font-size:12px}.steps span.on{background:var(--teal2);color:#06605f;font-weight:600}.pgrid{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}.pgrid .field{margin:7px 0}.pgrid .full{grid-column:1/3}details.role{border:1px solid var(--line);border-radius:10px;margin:8px 0;padding:0 12px}details.role summary{cursor:pointer;padding:11px 0;font-weight:600;display:flex;justify-content:space-between;gap:10px}details.role[open]{background:#fcfdfd}.req{color:#b3541e;font-size:11px;font-weight:600}.ok{color:#29804c;font-size:11px;font-weight:600}.field.err input,.field.err textarea{border-color:#c0392b}.ptable td{vertical-align:top}.wizsteps{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.wst{border:1px solid var(--line);border-radius:11px;padding:11px 13px;background:#fbfcfc;text-align:left;color:var(--ink);display:flex;flex-direction:column;gap:5px}.wst.sel{border-color:var(--teal);box-shadow:0 0 0 2px #08808022;background:#fff}.wst.locked{opacity:.55;cursor:not-allowed}.wst .wn{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px}.wst b{font-size:14px}.wst .wc{font-size:12px;color:var(--muted)}.wbd{display:inline-block;border-radius:10px;padding:1px 8px;font-size:11px;font-weight:700;width:max-content}.wbd.done{background:#e5f5ec;color:#29804c}.wbd.work{background:#e1f3f1;color:#06605f}.wbd.locked{background:#f2f4f4;color:#738187}.wbd.stale{background:#fdecc8;color:#a86a12}.wkv{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}.wkv span{background:#f4f8f8;border:1px solid var(--line);border-radius:8px;padding:6px 10px;font-size:12px}.wkv span b{font-size:15px;margin-right:4px}.wact{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.wscope{border:1px solid var(--line);border-radius:7px;padding:4px 6px;font-size:12px}tr.wsx td{color:#9aa7ad;text-decoration:line-through}tr.wsx td.ws{text-decoration:none}@media(max-width:900px){.wizsteps{grid-template-columns:1fr 1fr}}
+:root{--ink:#172a35;--muted:#72818a;--line:#e5ebed;--bg:#f5f8f8;--teal:#087f80;--teal2:#e1f3f1;--orange:#e8954a;--white:#fff;--shadow:0 8px 28px #1c33400b}*{box-sizing:border-box}body{margin:0;background:var(--bg);font:14px/1.45 Inter,system-ui,-apple-system,Segoe UI,sans-serif;color:var(--ink)}button,input,select,textarea{font:inherit}button{cursor:pointer}.app{display:grid;grid-template-columns:240px 1fr;min-height:100vh}.side{background:#112b36;color:#e8f0f1;padding:24px 16px;display:flex;flex-direction:column}.brand{padding:0 10px 30px;display:flex;gap:11px;align-items:center}.logo{width:34px;height:34px;border-radius:11px;background:linear-gradient(135deg,#20aaa0,#087f80);display:grid;place-items:center;color:white;font-weight:800}.brand strong{display:block;font-size:15px}.brand small{color:#9fb3b9}.navlabel{padding:14px 10px 8px;color:#81969d;text-transform:uppercase;font-size:10px;letter-spacing:1.3px}.nav button{border:0;background:transparent;color:#bdcbd0;padding:11px 12px;border-radius:9px;width:100%;text-align:left;display:flex;gap:12px;align-items:center;margin:2px 0}.nav button.active,.nav button:hover{background:#21444d;color:#fff}.nav i{font-style:normal;width:18px;text-align:center}.sidefoot{margin-top:auto;border-top:1px solid #29434b;padding:16px 10px 0;color:#9fb3b9;font-size:12px}.main{min-width:0}.top{height:72px;background:#fff;border-bottom:1px solid var(--line);padding:0 34px;display:flex;align-items:center;justify-content:space-between}.crumb{color:var(--muted);font-size:13px}.person{display:flex;align-items:center;gap:10px}.avatar{width:34px;height:34px;border-radius:50%;background:#e3f2ef;color:#087f80;display:grid;place-items:center;font-weight:700}.wrap{max-width:1400px;margin:auto;padding:28px 34px 60px}.heading{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:22px}.heading h1{font-size:25px;margin:0 0 4px;letter-spacing:-.5px}.sub{color:var(--muted)}.tag{border-radius:20px;background:#eef5f5;color:#49636b;padding:7px 11px;font-size:12px;display:inline-flex;align-items:center;gap:7px}.dot{height:7px;width:7px;border-radius:50%;background:#df9d48}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.card,.panel{background:var(--white);border:1px solid var(--line);border-radius:13px;box-shadow:var(--shadow)}.metric{padding:18px 20px}.metric-top{color:var(--muted);display:flex;justify-content:space-between;align-items:center}.metric-icon{font-size:18px;color:var(--teal);background:#edf8f6;border-radius:9px;width:34px;height:34px;display:grid;place-items:center}.metric strong{font-size:27px;display:block;margin:11px 0 3px}.metric small{color:var(--muted)}.section{margin-top:22px}.sectionhead{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}.sectionhead h2{font-size:16px;margin:0}.btn{border:1px solid var(--line);background:#fff;color:var(--ink);border-radius:8px;padding:9px 12px}.btn:hover{border-color:#91bcba}.btn.primary{background:var(--teal);color:white;border-color:var(--teal)}.btn.primary:hover{background:#086c6e}.btn.small{padding:6px 9px;font-size:12px}.filters{display:flex;gap:8px;align-items:center}.filters select,.filters input,.field input,.field textarea,.field select{border:1px solid var(--line);border-radius:8px;padding:9px 10px;background:#fff;color:var(--ink)}.filters input{width:210px}.tablewrap{overflow:auto}.table{width:100%;border-collapse:collapse;min-width:760px}.table th{text-align:left;color:var(--muted);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.45px;background:#fbfcfc;padding:12px 14px;border-bottom:1px solid var(--line)}.table td{padding:13px 14px;border-bottom:1px solid #eff2f2;vertical-align:middle}.table tr:last-child td{border:0}.code{font-weight:700}.kind{color:var(--muted);font-size:12px}.status{display:inline-flex;align-items:center;gap:6px;border-radius:20px;padding:5px 9px;font-size:11px;white-space:nowrap}.status.done{background:#e5f5ec;color:#29804c}.status.todo{background:#f2f4f4;color:#738187}.checkrow{display:flex;align-items:center;gap:9px}.checkrow input{accent-color:var(--teal);width:17px;height:17px}.personcell{font-size:12px;color:var(--muted)}.panel{padding:18px 20px}.notice{background:#fff6e9;border:1px solid #f6e2c8;border-radius:10px;padding:12px 14px;color:#7e5a32;margin:0 0 18px;font-size:12px}.hidden{display:none!important}.empty{padding:32px;text-align:center;color:var(--muted)}.cards2{display:grid;grid-template-columns:1fr 1fr;gap:14px}.timeline{border-left:2px solid #dce8e7;margin:8px 0 0 8px;padding-left:18px}.event{position:relative;padding:0 0 20px}.event:before{content:'';position:absolute;width:9px;height:9px;border-radius:50%;background:var(--teal);left:-24px;top:4px}.event strong{display:block}.event small{color:var(--muted)}.docsrow{display:flex;align-items:center;justify-content:space-between;padding:14px 0;border-bottom:1px solid var(--line)}.docsrow:last-child{border:0}.modal{position:fixed;inset:0;background:#12263077;display:grid;place-items:center;padding:18px;z-index:80}.dialog{background:white;border-radius:14px;padding:22px;width:min(520px,100%);max-height:94vh;overflow:auto;box-shadow:0 24px 70px #10252c44}.dialog h2{margin:0 0 16px;font-size:19px}.field{display:flex;flex-direction:column;gap:6px;margin:12px 0}.field label{font-size:12px;color:var(--muted)}.field textarea{min-height:82px;resize:vertical}.dialogactions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px;position:sticky;bottom:-22px;background:white;padding:10px 0 2px;z-index:2}.toast{position:fixed;bottom:22px;right:22px;background:#173c43;color:white;padding:12px 16px;border-radius:9px;box-shadow:var(--shadow);z-index:90}.loading{color:var(--muted);padding:28px}.pick{display:none;align-items:center}.deskcrumb{display:block;max-width:70%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.side{position:sticky;top:0;height:100vh;overflow:hidden}.objtree{overflow-y:auto;overflow-x:hidden;flex:1;min-height:0;margin:0 -4px 6px;padding:0 4px}.treefilter{width:100%;margin:0 0 6px;padding:7px 9px;border-radius:8px;border:1px solid #2c5560;background:#183a45;color:#e8f0f1;font-size:12px}.treefilter::placeholder{color:#7f959c}.archtoggle{width:100%;text-align:left;border:0;background:transparent;color:#81969d;font-size:12px;padding:8px 6px 4px}.archtoggle:hover{color:#fff}.obj.arch .nm{color:#8ea2a8;font-weight:500}.navs{margin-top:4px}.navlabel{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.navname{text-transform:none;letter-spacing:0;color:#b5c6cb;font-size:11px;margin-left:4px}.nav.second{margin-bottom:6px}.tabs{display:flex;gap:2px;align-items:flex-end;background:#fff;border-bottom:1px solid var(--line);padding:0 34px;overflow-x:auto;white-space:nowrap}.tabs .scope{align-self:center;margin-right:16px;font-size:10px;text-transform:uppercase;letter-spacing:1.2px;color:var(--muted);background:#f2f6f6;border-radius:6px;padding:4px 8px}.tabs button{border:0;background:transparent;padding:14px 14px 12px;color:#53666e;border-bottom:2px solid transparent;font-size:13.5px;display:flex;gap:7px;align-items:center;flex:none}.tabs button:hover{color:var(--ink)}.tabs button.active{color:var(--teal);border-bottom-color:var(--teal);font-weight:600}.bdg{font-size:11px;font-weight:700;border-radius:10px;padding:0 7px;background:#eef2f2;color:#72818a;line-height:18px}.bdg.warn{background:#fdecc8;color:#a86a12}.pbar{height:6px;background:#e8eeee;border-radius:4px;overflow:hidden;margin-top:5px}.pbar i{display:block;height:100%;background:var(--teal);transition:width .2s}.pbar.proc i{background:repeating-linear-gradient(45deg,#e1a24b,#e1a24b 8px,#efc27d 8px,#efc27d 16px);animation:mv 1s linear infinite;background-size:22px 22px}@keyframes mv{from{background-position:0 0}to{background-position:22px 0}}.uprow{padding:9px 0;border-bottom:1px solid var(--line);font-size:13px}.uprow .st{color:var(--muted);font-size:12px;margin-top:4px}.uprow.err .st{color:#b3541e;font-weight:600}.uprow.done .st{color:#29804c;font-weight:600}.srcblock{margin:0 0 16px}.linkrow{display:flex;gap:8px;margin:8px 0 4px}.linkrow input{flex:1;min-width:0;border:1px solid var(--line);border-radius:8px;padding:9px 10px}.hintbox{background:#f4f8f8;border:1px solid var(--line);border-radius:8px;padding:9px 11px;font-size:12px;color:#53666e;margin-top:8px}.chip{font-size:11px;border-radius:10px;padding:2px 8px;white-space:nowrap}.chip.new{background:#fdecc8;color:#a86a12}.chip.loaded{background:#e5f5ec;color:#29804c}.okline{color:#29804c;font-weight:600}.warnline{color:#b3541e;font-weight:600}.inboxlist{max-height:190px;overflow:auto;font-size:12px;margin:8px 0}.inboxlist div.r{display:flex;justify-content:space-between;gap:8px;padding:5px 0;border-bottom:1px solid #eef2f2}.inboxlist div.r span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}code{background:#eef3f3;border-radius:4px;padding:1px 5px;font-size:12px}.objhead.sel{background:#21444d;color:#fff}.crumb a{color:inherit;cursor:pointer;text-decoration:none}.crumb a:hover{color:var(--teal)}.obj{border-radius:9px;margin:3px 0}.sbedit{border:0;background:transparent;color:#9fb3b9;width:22px;flex:none;font-size:12px;padding:6px 0;opacity:0;transition:opacity .15s}.objline:hover .sbedit,.secline:hover .sbedit,.sbedit:focus{opacity:1}.sbedit:hover{color:#fff}.secline{position:relative;display:flex;align-items:center}.secline .secrow{flex:1;min-width:0}.objline{display:flex;align-items:flex-start}.chev{border:0;background:transparent;color:#9fb3b9;width:22px;padding:8px 0;font-size:12px;flex:none}.chev:hover{color:#fff}.secs{max-height:210px;overflow-y:auto;overflow-x:hidden;margin:0 0 4px}.objhead{flex:1;min-width:0;text-align:left;border:0;background:transparent;color:#d7e3e6;padding:8px 10px;border-radius:9px;display:flex;gap:8px;align-items:flex-start;line-height:1.3}.objhead:hover{background:#1c3c46}.objhead .nm{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;font-size:13px;font-weight:600;flex:1}.objhead .warn{color:#f0b35c;font-size:12px;font-weight:700}.obj.cur>.objhead{color:#fff}.secrow{width:100%;text-align:left;border:0;background:transparent;color:#9fb3b9;padding:6px 10px 6px 30px;font-size:12px;border-radius:8px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.secrow b{color:#d7e3e6;font-weight:700;margin-right:6px}.secrow.cur b{color:#fff}.secrow:hover{background:#1c3c46;color:#fff}.secrow.cur{background:#21444d;color:#fff;font-weight:600}.newobj{width:100%;margin:6px 0 4px;background:#183a45;border-color:#2c5560;color:#cfe2e5;font-size:12px}.newobj:hover{background:#21444d;border-color:#3a7480}.pick select{border:1px solid var(--line);border-radius:8px;padding:7px 9px;background:#fff;color:var(--ink);max-width:260px;font-weight:600}.dialog.wide{width:min(900px,100%);max-height:92vh;overflow:auto}.steps{display:flex;gap:8px;margin:0 0 14px}.steps span{flex:1;padding:7px 10px;border-radius:8px;background:#f2f4f4;color:#738187;font-size:12px}.steps span.on{background:var(--teal2);color:#06605f;font-weight:600}.pgrid{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}.pgrid .field{margin:7px 0}.pgrid .full{grid-column:1/3}details.role{border:1px solid var(--line);border-radius:10px;margin:8px 0;padding:0 12px}details.role summary{cursor:pointer;padding:11px 0;font-weight:600;display:flex;justify-content:space-between;gap:10px}details.role[open]{background:#fcfdfd}.req{color:#b3541e;font-size:11px;font-weight:600}.ok{color:#29804c;font-size:11px;font-weight:600}.field.err input,.field.err textarea{border-color:#c0392b}.ptable td{vertical-align:top}.wizsteps{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.wst{border:1px solid var(--line);border-radius:11px;padding:11px 13px;background:#fbfcfc;text-align:left;color:var(--ink);display:flex;flex-direction:column;gap:5px}.wst.sel{border-color:var(--teal);box-shadow:0 0 0 2px #08808022;background:#fff}.wst.locked{opacity:.55;cursor:not-allowed}.wst .wn{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px}.wst b{font-size:14px}.wst .wc{font-size:12px;color:var(--muted)}.wbd{display:inline-block;border-radius:10px;padding:1px 8px;font-size:11px;font-weight:700;width:max-content}.wbd.done{background:#e5f5ec;color:#29804c}.wbd.work{background:#e1f3f1;color:#06605f}.wbd.locked{background:#f2f4f4;color:#738187}.wbd.stale{background:#fdecc8;color:#a86a12}.wkv{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}.wkv span{background:#f4f8f8;border:1px solid var(--line);border-radius:8px;padding:6px 10px;font-size:12px}.wkv span b{font-size:15px;margin-right:4px}.wact{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.wscope{border:1px solid var(--line);border-radius:7px;padding:4px 6px;font-size:12px}tr.wsx td{color:#9aa7ad;text-decoration:line-through}tr.wsx td.ws{text-decoration:none}@media(max-width:900px){.wizsteps{grid-template-columns:1fr 1fr}}.wsub{display:flex;gap:6px;flex-wrap:wrap}.wsub button{border:1px solid var(--line);background:#fbfcfc;border-radius:9px;padding:7px 10px;font-size:13px;display:flex;gap:6px;align-items:center}.wsub button.on{border-color:var(--teal);background:#fff;box-shadow:0 0 0 2px #08808022;font-weight:600}.grow{padding:8px 9px;border-radius:8px;cursor:pointer;border:1px solid transparent;margin:2px 0}.grow:hover{background:#f4f8f8}.grow.on{border-color:var(--teal);background:#eef8f7}.grow a{cursor:pointer;color:var(--muted);padding:0 3px}.dialog:has(.wz2wide){width:min(960px,100%)}
 @media(max-width:900px){.pick{display:flex;flex-wrap:wrap;gap:6px}.deskcrumb{display:none}.app{display:block}.side{display:none}.wrap{padding:22px 18px 50px}.top{padding:8px 18px;height:auto;min-height:60px}.tabs{padding:0 10px}.grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:620px){.heading{display:block}.heading .tag{margin-top:12px}.grid{gap:8px}.metric{padding:14px}.metric strong{font-size:22px}.cards2{grid-template-columns:1fr}.filters{margin-top:10px;flex-wrap:wrap}.filters input{width:160px}.sectionhead{align-items:flex-start;flex-direction:column;gap:10px}.wrap{padding:18px 12px 40px}.person{display:none}}
 .we{display:inline-block;background:#0f7a7a;color:#fff;border-radius:4px;font-size:10px;font-weight:700;padding:1px 5px;margin-left:4px;vertical-align:middle}
 .teamadd{display:grid;grid-template-columns:1.4fr 1fr 1fr 90px auto;gap:6px;margin:10px 0}.teamadd input,.teamadd select{min-width:0}
@@ -12489,7 +13129,7 @@ HTML = r'''<!doctype html>
 <section id="page-list" class="hidden"><div class="dtabs"><button id="swFiles2" onclick="showPage('files')">Файлы проекта</button><button id="swList2" class="on" onclick="showPage('list')">Перечень работ · каркас ИД</button><button id="swMatch" onclick="showPage('match')">Сопоставление со сметой</button></div><div class="heading"><div><h1>Перечень работ</h1><div class="sub">Что отмечает прораб: колодцы, участки, операции — для выбранного раздела</div></div><div style="display:flex;gap:8px;align-items:center"><button class="btn" onclick="openZones()" id="zBtn">Состав раздела…</button><div class="tag" id="listTag">—</div></div></div><div class="panel" id="wizBox" style="margin-bottom:16px"><div class="wizsteps" id="wizSteps"><div class="loading">Загружаем шаги…</div></div><div id="wizBody" style="margin-top:14px"></div><button class="btn hidden" id="elAddBtn" onclick="elFormToggle()">Добавить элемент вручную</button><div id="elFormBox" class="hidden" style="margin-top:14px;max-width:560px"><h3 style="margin:0 0 8px;font-size:15px">Добавить элемент вручную</h3><form id="elementForm"><div class="field"><label>Шифр на плане</label><input name="code" placeholder="К-03" required></div><div class="field"><label>Название объекта / участка</label><input name="name" placeholder="Колодец К-03" required></div><div class="field"><label>Вид элемента</label><select name="kind"><option>Колодец</option><option>Трубопровод</option><option>Узел</option><option>Камера</option><option>Выпуск</option><option>Другое</option></select></div><div class="field"><label id="elBlkLbl">Часть раздела</label><input name="block" value="Часть 1" list="blkList"></div><div class="field"><label>Примечание по проекту</label><textarea name="planned_note" placeholder="Ссылка на лист, оси, пикетаж"></textarea></div><button class="btn primary" type="submit">Добавить в перечень</button></form></div></div><div class="panel hidden" id="wizLeft" style="margin-bottom:16px"><div class="sectionhead"><h2>Остатки для ручного сопоставления</h2></div><div class="dtabs" id="ltTabs" style="margin-top:8px"></div><div class="sub" id="ltNote" style="margin:8px 0"></div><div class="tablewrap" style="max-height:60vh;overflow:auto"><table class="table" style="min-width:760px"><thead id="ltHead"></thead><tbody id="ltBody"><tr><td class="loading">Загружаем…</td></tr></tbody></table></div></div><div class="cards2"><div class="panel"><div class="sectionhead"><h2>Загрузка готового перечня</h2></div><div id="seedBox" class="sub">Загружаем список наборов…</div></div></div></section></div></main></div><div id="modal" class="hidden"></div><div id="toast" class="toast hidden"></div>
 <script>
 let elements=[], overviewData={}, projects=[], roles=[], cur={project:null,section:null};
-const SCOPED=['/api/wizard','/api/wizard/analyze','/api/wizard/step','/api/wizard/match','/api/wizard/list','/api/overview','/api/elements','/api/history','/api/ozhr','/api/ozhr/extra','/api/ozhr/meta','/api/ozhr/rows','/api/ozhr/staff','/api/ozhr/reassign','/api/weather','/api/weather/fill','/api/weather/coords','/api/acts','/api/acts/proposals','/api/gantt','/api/vhk','/api/vhk-expected','/api/vhk-expected/link','/api/vhk-docs','/api/vhk-docs/one','/api/vhk-docs/file','/api/vhk-docs/rows','/api/vhk-docs/links','/api/vhk-docs/class','/api/work-analysis','/api/work-analysis/facts','/api/work-analysis/fact','/api/kits','/api/estimate-relations','/api/estimate-lines/review','/api/complex-rules','/api/double-count','/api/row-card','/api/facts','/api/facts/queue','/api/ledger','/api/estimates','/api/estimate-rows','/api/works','/api/coverage','/api/norm-refs','/api/norm-reqs','/api/norm-refs/scan','/api/alloc','/api/alloc/auto','/api/alloc/confirm','/api/lab','/api/lab/rules','/api/lab/seed','/api/lab/protocols','/api/lab/file','/api/audit','/api/schemes','/api/zones','/api/zones/term','/api/zones/rename','/api/zones/delete','/api/zones/move','/api/doc-status','/api/suggest-list','/api/elements/bulk','/api/documents','/api/revisions','/api/schema-versions'];
+const SCOPED=['/api/wz2','/api/wz2/items','/api/wz2/items/bulk','/api/wz2/groups','/api/wz2/confirm','/api/wz2/rollback','/api/wz2/history','/api/wizard','/api/wizard/analyze','/api/wizard/step','/api/wizard/match','/api/wizard/list','/api/overview','/api/elements','/api/history','/api/ozhr','/api/ozhr/extra','/api/ozhr/meta','/api/ozhr/rows','/api/ozhr/staff','/api/ozhr/reassign','/api/weather','/api/weather/fill','/api/weather/coords','/api/acts','/api/acts/proposals','/api/gantt','/api/vhk','/api/vhk-expected','/api/vhk-expected/link','/api/vhk-docs','/api/vhk-docs/one','/api/vhk-docs/file','/api/vhk-docs/rows','/api/vhk-docs/links','/api/vhk-docs/class','/api/work-analysis','/api/work-analysis/facts','/api/work-analysis/fact','/api/kits','/api/estimate-relations','/api/estimate-lines/review','/api/complex-rules','/api/double-count','/api/row-card','/api/facts','/api/facts/queue','/api/ledger','/api/estimates','/api/estimate-rows','/api/works','/api/coverage','/api/norm-refs','/api/norm-reqs','/api/norm-refs/scan','/api/alloc','/api/alloc/auto','/api/alloc/confirm','/api/lab','/api/lab/rules','/api/lab/seed','/api/lab/protocols','/api/lab/file','/api/audit','/api/schemes','/api/zones','/api/zones/term','/api/zones/rename','/api/zones/delete','/api/zones/move','/api/doc-status','/api/suggest-list','/api/elements/bulk','/api/documents','/api/revisions','/api/schema-versions'];
 const SCOPED_PFX=['/api/works/','/api/kits/','/api/complex-rules/','/api/estimate-lines/'];
 function scoped(path){return cur.section&&(SCOPED.some(p=>path===p||path.startsWith(p+'?'))||SCOPED_PFX.some(p=>path.startsWith(p))||path.startsWith('/api/schemes/'))?path+(path.includes('?')?'&':'?')+'section='+encodeURIComponent(cur.section):path}
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -12888,13 +13528,11 @@ function elFormToggle(){const b=document.getElementById('elFormBox');b.classList
 function listAutoOpen(){openModal(`<h2>Составить перечень автоматически</h2><p class="sub" style="margin:0 0 12px">Программа предложит элементы по загруженным файлам раздела; вы выбираете, что добавить.</p><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn primary" onclick="closeModal();openSuggest('project')">Объекты и работы из проекта</button><button class="btn" onclick="closeModal();openSuggest('estimate')">Позиции сметы без объекта</button></div><div class="dialogactions"><button class="btn" onclick="closeModal()">Закрыть</button></div>`)}
 let WZ=null,WZsel=0,WZL=null,WZF='all';
 const WZST={done:'готово',work:'в работе',locked:'недоступно',stale:'устарело'};
-async function wizLoad(){try{WZ=await api('/api/wizard')}catch(e){document.getElementById('wizSteps').innerHTML='<div class="empty">'+esc(e.message)+'</div>';return}
- if(!WZsel||WZ.steps[WZsel-1].status==='locked')WZsel=WZ.current;wizRender()}
 function wizCnt(s){const c=s.counters||{};if(s.n===1)return `объектов в перечне: ${c.elements||0} · файлов проекта: ${c.project_files||0}`;
  if(s.n===2)return `наша работа: ${c.ours||0}`+(c.excluded?` · не делаем: ${c.excluded}`:'')+(c.other?` · др. подрядчик: ${c.other}`:'');
  if(s.n===3)return s.counters?`работы ${c.works_ok}/${c.works} · объекты ${c.objects_ok}/${c.objects} · материалы ${c.mats_ok}/${c.mats}`:'смет раздела: '+(s.estimate_files||0);
  return s.counters?`осталось: работ ${c.left_works} · объектов ${c.left_objects} · материалов ${c.left_mats}`:'—'}
-function wizRender(){const W=WZ;if(!W)return;
+function wizRenderV1(){const W=WZ;if(!W)return;
  document.getElementById('wizSteps').innerHTML=W.steps.map(s=>`<button class="wst ${s.status} ${WZsel===s.n?'sel':''}" ${s.status==='locked'?'disabled title="Сначала завершите предыдущий шаг"':''} onclick="wizOpen(${s.n})"><span class="wn">Шаг ${s.n}</span><b>${esc(s.title)}</b><span class="wbd ${s.status}">${WZST[s.status]}${s.n===2&&s.changed_after_confirm?' · изменён после подтверждения':''}</span><span class="wc">${esc(wizCnt(s))}</span></button>`).join('');
  const s=W.steps[WZsel-1],b=document.getElementById('wizBody'),left=document.getElementById('wizLeft');left.classList.toggle('hidden',WZsel!==4);
  const who=x=>x.at?`<span class="kind">${esc(fmtDT(x.at))}${x.by?' · '+esc(x.by):''}</span>`:'';
@@ -12921,11 +13559,11 @@ function wizRender(){const W=WZ;if(!W)return;
   <div class="wkv"><span><b>${c.left_works??'—'}</b>работ сметы</span><span><b>${c.left_objects??'—'}</b>объектов проекта без сметы</span><span><b>${c.left_mats??'—'}</b>материалов</span></div>
   <div class="wact">${s.status==='done'?'<span class="okline" style="align-self:center">Перечень передан прорабу</span><button class="btn" onclick="wizReopen(4)">Вернуть в работу</button>':`<button class="btn primary" onclick="wizFinish()">Завершить — передать перечень прорабу</button>`}${W.handed_to_foreman&&s.status!=='done'?`<span class="kind" style="align-self:center">Прораб уже видит перечень (${esc(W.handed_by||'')} · ${esc(fmtDT(W.handed_at))})</span>`:''}</div>`;
   LTF='un';if(!AL)listTabsLoad();else listTabsRender()}}
-function wizOpen(n){if(!WZ||WZ.steps[n-1].status==='locked')return;WZsel=n;wizRender()}
+
 async function wizAnalyze(){const b=document.getElementById('wizBody');try{toast('Анализируем файлы проекта…');await api('/api/wizard/analyze',{method:'POST'});await wizLoad()}catch(e){toast(e.message,true)}}
-async function wizStep(n){try{WZ=await api('/api/wizard/step',{method:'POST',body:JSON.stringify({step:n})});WZsel=Math.min(n+1,4);if(n===4)WZsel=4;wizRender();toast(n===1?'Перечень сформирован':n===2?'Перечень подтверждён':'Перечень передан прорабу');if(n===4)load()}catch(e){toast(e.message,true)}}
-async function wizReopen(n){try{WZ=await api('/api/wizard/step',{method:'POST',body:JSON.stringify({step:n,action:'reopen'})});WZsel=n;wizRender()}catch(e){toast(e.message,true)}}
-async function wizMatch(){try{toast('Сопоставляем со сметой…');const r=await api('/api/wizard/match',{method:'POST'});WZ=r.state;WZsel=3;wizRender();const c=r.counters;toast(`Готово: работ ${c.works_ok}/${c.works}, объектов ${c.objects_ok}/${c.objects}`);AL=null;listTabsLoad()}catch(e){toast(e.message,true)}}
+async function wizStep(n){try{await api('/api/wizard/step',{method:'POST',body:JSON.stringify({step:n})});WZsel=Math.min(n+1,4);if(n===4)WZsel=4;await wizLoad();toast(n===1?'Перечень сформирован':n===2?'Перечень подтверждён':'Перечень передан прорабу');if(n===4)load()}catch(e){toast(e.message,true)}}
+async function wizReopen(n){try{await api('/api/wizard/step',{method:'POST',body:JSON.stringify({step:n,action:'reopen'})});WZsel=n;await wizLoad()}catch(e){toast(e.message,true)}}
+async function wizMatch(){try{toast('Сопоставляем со сметой…');const r=await api('/api/wizard/match',{method:'POST'});WZsel=3;await wizLoad();const c=r.counters;toast(`Готово: работ ${c.works_ok}/${c.works}, объектов ${c.objects_ok}/${c.objects}`);AL=null;listTabsLoad()}catch(e){toast(e.message,true)}}
 async function wizFinish(){const c=WZ.steps[3].counters||{},n=(c.left_works||0)+(c.left_objects||0)+(c.left_mats||0);if(n&&!confirm(`Не сопоставлено: работ ${c.left_works}, объектов ${c.left_objects}, материалов ${c.left_mats}. Всё равно передать перечень прорабу?`))return;await wizStep(4)}
 async function wizListLoad(){try{WZL=(await api('/api/wizard/list')).elements;wizListRender()}catch(e){toast(e.message,true)}}
 function wizListRender(){const tb=document.getElementById('wizListBody');if(!tb||!WZL)return;const L=WZL.filter(e=>WZF==='all'||(WZF==='ours'?!e.scope:!!e.scope));
@@ -12933,6 +13571,65 @@ function wizListRender(){const tb=document.getElementById('wizListBody');if(!tb|
 async function wizScope(id,v){let note='';if(v){note=prompt('Комментарий (необязательно): почему объект '+(v==='other'?'выполняет другой подрядчик':'не делаем'),'')??'';}try{const r=await api('/api/elements/'+encodeURIComponent(id),{method:'PUT',body:JSON.stringify({scope:v,scope_note:note})});toast(r.message);await Promise.all([wizLoad(),load()]);AL=null}catch(e){toast(e.message,true);wizListLoad()}}
 function wizEdit(id){const e=WZL.find(x=>x.id===id);if(!e)return;openModal(`<h2>Объект перечня</h2><div class="field"><label>Шифр на плане</label><input id="weCode" value="${esc(e.code)}"></div><div class="field"><label>Наименование</label><input id="weName" value="${esc(e.name)}"></div><div class="field"><label>Вид</label><input id="weKind" value="${esc(e.kind)}"></div><div class="field"><label>Часть раздела</label><input id="weBlock" value="${esc(e.block)}"></div><div class="field"><label>Примечание по проекту</label><textarea id="weNote">${esc(e.planned_note)}</textarea></div><div class="dialogactions"><button class="btn" onclick="closeModal()">Отмена</button><button class="btn primary" onclick="wizEditSave('${e.id}')">Сохранить</button></div>`)}
 async function wizEditSave(id){const g=k=>document.getElementById(k).value;try{const r=await api('/api/elements/'+encodeURIComponent(id),{method:'PUT',body:JSON.stringify({code:g('weCode'),name:g('weName'),kind:g('weKind'),block:g('weBlock'),planned_note:g('weNote')})});closeModal();toast(r.message);await Promise.all([wizLoad(),load()])}catch(e){toast(e.message,true)}}
+let WZ2=null,WZ2sub='1.2',WZ2it=[],WZ2sel=new Set(),WZ2f={layer:'object',state:'',group:'',q:''},WZ2g=null,WZ2open=new Set();
+const WZ2ST={done:'готово',work:'в работе',locked:'недоступно',stale:'устарело',todo:'не начат',skipped:'пропущено'};
+const WZ2STATE={proposed:'предложено',accepted:'принято',edited:'изменено',rejected:'отклонено'};
+async function wizLoad(){try{[WZ2,WZ]=await Promise.all([api('/api/wz2'),api('/api/wizard')])}catch(e){document.getElementById('wizSteps').innerHTML='<div class="empty">'+esc(e.message)+'</div>';return}
+ if(!WZsel||WZ2.steps[WZsel-1].status==='locked')WZsel=WZ2.current;wizRender()}
+function wz2Cnt(s){const c=s.stats||{};if(s.n===1)return `объектов ${c.objects||0} · работ ${c.works||0}`+((c.object_rejected||0)+(c.work_rejected||0)?` · отклонено ${(c.object_rejected||0)+(c.work_rejected||0)}`:'');
+ if(s.n===2)return `групп ${c.groups||0} · объектов в группах ${c.members||0}`;const k=s.counters;if(s.n===3)return k?`работы ${k.works_ok}/${k.works} · объекты ${k.objects_ok}/${k.objects}`:'—';return k?`осталось: работ ${k.left_works} · объектов ${k.left_objects}`:'—'}
+function wizOpen(n){if(!WZ2||WZ2.steps[n-1].status==='locked')return;WZsel=n;wizRender()}
+function wizRender(){const W=WZ2;if(!W)return;
+ document.getElementById('wizSteps').innerHTML=W.steps.map(s=>`<button class="wst ${s.status} ${WZsel===s.n?'sel':''}" ${s.status==='locked'?'disabled title="Сначала завершите предыдущий шаг"':''} onclick="wizOpen(${s.n})"><span class="wn">Шаг ${s.n}</span><b>${esc(s.title)}</b><span class="wbd ${s.status}">${WZ2ST[s.status]||s.status}${s.note?' · '+esc(s.note):''}</span><span class="wc">${esc(wz2Cnt(s))}</span></button>`).join('')+`<div class="wact" style="grid-column:1/-1;margin:0"><button class="btn small" onclick="wz2Journal()">Снимки и откат (${W.snapshots.length})</button><button class="btn small" onclick="wz2Hist()">Журнал изменений</button>${W.handed_to_foreman?'<span class="kind" style="align-self:center">Перечень передан прорабу</span>':''}</div>`;
+ const left=document.getElementById('wizLeft');if(WZsel>=3){const keep=document.getElementById('wizSteps').innerHTML;wizRenderV1();document.getElementById('wizSteps').innerHTML=keep;return}left.classList.add('hidden');
+ const b=document.getElementById('wizBody'),s=W.steps[WZsel-1];
+ if(WZsel===1){const subs=s.sub;b.innerHTML=`<div class="wsub">${subs.map(x=>`<button class="${WZ2sub===x.id?'on':''}" onclick="WZ2sub='${x.id}';wizRender()">${x.id} ${esc(x.title)} <span class="wbd ${x.status==='skipped'?'locked':x.status}">${WZ2ST[x.status]||x.status}</span></button>`).join('')}</div><div id="wz2SubBody" style="margin-top:12px"></div>
+  <div class="wact" style="border-top:1px solid var(--line);padding-top:10px"><button class="btn primary" onclick="wz2Confirm('1')">${s.status==='done'?'Шаг 1 подтверждён — подтвердить заново':'Подтвердить шаг 1 → в перечень'}</button><button class="btn" onclick="wz2Journal(1)">Откатить шаг 1…</button>${s.at?`<span class="kind" style="align-self:center">подтверждён ${esc(fmtDT(s.at))} · ${esc(s.by||'')}</span>`:''}</div>`;wz2SubRender()}
+ else{b.innerHTML=`<p class="sub" style="margin:0">Группы — единицы, которые выполняются вместе: колодец, секция пожаротушения, узел задвижек, щит, участок трубы. Вложенность необязательна. Группа становится участком у прораба.</p><div style="display:grid;grid-template-columns:300px 1fr;gap:14px;margin-top:10px"><div id="wz2Groups" class="panel" style="padding:10px;max-height:60vh;overflow:auto">Загружаем…</div><div id="wz2SubBody"></div></div>
+  <div class="wact" style="border-top:1px solid var(--line);padding-top:10px"><button class="btn primary" onclick="wz2Confirm('2')" ${W.steps[0].status!=='done'?'disabled title="Сначала подтвердите шаг 1"':''}>${s.status==='done'?'Подтвердить заново':'Подтвердить состав → в перечень'}</button><button class="btn" onclick="wz2Journal(2)">Откатить шаг 2…</button>${s.at?`<span class="kind" style="align-self:center">подтверждён ${esc(fmtDT(s.at))} · ${esc(s.by||'')}</span>`:''}</div>`;WZ2f.layer='object';wz2GroupsLoad()}}
+function wz2SubRender(){const box=document.getElementById('wz2SubBody');if(!box)return;const x=WZ2.steps[0].sub.find(y=>y.id===WZ2sub);
+ const foot=`<div class="wact"><button class="btn small" onclick="wz2Confirm('${x.id}')">Подшаг выполнен</button>${x.phase!=='Ф0'?`<button class="btn small" onclick="wz2Confirm('${x.id}','skip')">Пропустить</button>`:''}</div>`;
+ if(WZ2sub==='1.0'){const o=WZ&&WZ.steps[0]||{},c=o.counters||{},f=o.found||{};box.innerHTML=`<p class="sub" style="margin:0">Файлы раздела: основные — DXF чертежей и XML сметы. PDF и OCR — позже.</p><div class="wkv"><span><b>${c.project_files||0}</b>файлов проекта</span><span><b>${c.estimate_files||0}</b>смет</span>${f.at?`<span>найдено новых объектов: <b>${f.new_project}</b></span><span>чужие сети: ${esc(Object.entries(f.other_nets||{}).map(([k,v])=>k+' — '+v).join(', ')||'нет')}</span>`:''}</div><div class="wact"><button class="btn" onclick="wizAnalyze()">Проанализировать файлы</button><button class="btn" onclick="showPage('files')">Файлы проекта →</button></div>`+foot;return}
+ if(WZ2sub!=='1.2'){box.innerHTML=`<div class="hintbox">Подшаг «${esc(x.title)}» появится в этапе ${x.phase}${x.id==='1.1'?' (библиотека нормативов НВК по умолчанию: СП 129.13330.2019, СП 31.13330.2021, СП 32.13330.2018, СП 8.13130.2020, ГОСТ 21.704-2011, ПП РФ №87)':x.id==='1.3'?' (ведомость материалов из DXF, сверка со сметой)':' (справка замечаний, трудоёмкость по ГЭСН или своим нормам)'}. Сейчас его можно пропустить — это не блокирует следующие шаги.</div>`+foot;return}
+ box.innerHTML=`<div class="wact" style="margin:0 0 8px"><button class="btn small ${WZ2f.layer==='object'?'primary':''}" onclick="WZ2f.layer='object';wz2Items()">Объекты</button><button class="btn small ${WZ2f.layer==='work'?'primary':''}" onclick="WZ2f.layer='work';wz2Items()">Виды работ</button>
+  <select class="wscope" onchange="WZ2f.state=this.value;wz2Items()"><option value="">все состояния</option>${Object.entries(WZ2STATE).map(([k,v])=>`<option value="${k}" ${WZ2f.state===k?'selected':''}>${v}</option>`).join('')}<option value="excluded" ${WZ2f.state==='excluded'?'selected':''}>не делаем / другой подрядчик</option></select>
+  <input class="wscope" style="width:200px" placeholder="поиск: шифр, наименование" value="${esc(WZ2f.q)}" onchange="WZ2f.q=this.value;wz2Items()"><button class="btn small" onclick="wz2Add()">+ ${WZ2f.layer==='object'?'объект':'вид работ'}</button></div>
+  <div class="wact" id="wz2Bulk" style="margin:0 0 8px"></div><div class="tablewrap" style="max-height:55vh;overflow:auto"><table class="table" style="min-width:860px"><thead id="wz2Head"></thead><tbody id="wz2Body"><tr><td class="loading">Загружаем…</td></tr></tbody></table></div>`+foot;wz2Items()}
+async function wz2Items(){const qs=new URLSearchParams({layer:WZ2f.layer,state:WZ2f.state,q:WZ2f.q,group:WZ2f.group});try{const d=await api('/api/wz2/items?'+qs.toString());WZ2it=d.items;WZ2sel=new Set([...WZ2sel].filter(i=>WZ2it.some(x=>x.id===i)));wz2ItemsRender()}catch(e){toast(e.message,true)}}
+function wz2BulkRender(){const n=WZ2sel.size,el=document.getElementById('wz2Bulk');if(!el)return;const gs=(WZ2g&&WZ2g.groups)||[];
+ el.innerHTML=n?`<b style="align-self:center">Выделено: ${n}</b><button class="btn small" onclick="wz2BulkDo({state:'accepted'})">Принять</button><button class="btn small" onclick="wz2BulkDo({state:'rejected'})">Отклонить</button><button class="btn small" onclick="wz2BulkDo({scope:''})">Наша работа</button><button class="btn small" onclick="wz2BulkDo({scope:'excluded'})">Не делаем</button><button class="btn small" onclick="wz2BulkDo({scope:'other'})">Другой подрядчик</button>${gs.length?`<select class="wscope" onchange="if(this.value)wz2BulkDo({group_id:this.value==='-'?'':this.value})"><option value="">в группу…</option>${gs.map(g=>`<option value="${g.id}">${esc(g.name)}</option>`).join('')}<option value="-">— без группы</option></select>`:''}<button class="btn small" onclick="wz2Journal(WZsel,'items')">Откатить выделенные…</button><button class="btn small" onclick="WZ2sel.clear();wz2ItemsRender()">Снять выделение</button>`:`<span class="kind">Отметьте строки галочкой — появятся массовые действия. Показано: ${WZ2it.length}</span>`}
+function wz2ItemsRender(){const tb=document.getElementById('wz2Body');if(!tb)return;const isW=WZ2f.layer==='work';const gname={};((WZ2g&&WZ2g.groups)||[]).forEach(g=>gname[g.id]=g.name);
+ document.getElementById('wz2Head').innerHTML=`<tr><th style="width:28px"><input type="checkbox" onclick="wz2SelAll(this.checked)" ${WZ2it.length&&WZ2it.every(x=>WZ2sel.has(x.id))?'checked':''}></th><th>${isW?'Объект':'Шифр'}</th><th>Наименование</th><th>${isW?'Код':'Вид'}</th><th>Группа</th><th>Объём</th><th>Состояние</th><th>Отметки</th><th></th></tr>`;
+ const L=WZ2it.slice(0,400);tb.innerHTML=L.map(r=>`<tr class="${r.state==='rejected'||r.scope?'wsx':''}"><td class="ws"><input type="checkbox" ${WZ2sel.has(r.id)?'checked':''} onclick="wz2Sel('${r.id}',this.checked)"></td><td class="code">${esc(isW?r.parent_key:r.key)}</td><td>${esc(r.name)}${r.note?`<div class="kind">${esc(r.note.slice(0,120))}</div>`:''}</td><td class="kind">${esc(r.kind)}</td><td class="kind">${esc(gname[r.group_id]||'')}</td><td>${r.qty!=null?esc(r.qty)+' '+esc(r.unit):''}</td><td class="ws"><span class="wbd ${r.state==='rejected'?'locked':r.state==='accepted'?'done':'work'}">${WZ2STATE[r.state]||r.state}</span>${r.scope?`<div class="kind">${esc(WZ2.scopes[r.scope])}</div>`:''}<div class="kind">${r.origin==='legacy'?'из прежнего перечня':r.origin==='manual'?'вручную':'из проекта'}</div></td><td class="ws">${r.marks?`<b style="color:#9b6200">${r.marks}</b>`:''}</td><td class="ws"><button class="btn small" onclick="wz2Edit('${r.id}')">Изменить</button></td></tr>`).join('')+(WZ2it.length>400?`<tr><td colspan="9" class="kind">Показаны первые 400 из ${WZ2it.length} — уточните фильтр</td></tr>`:'')||'<tr><td colspan="9" class="empty">Нет пунктов</td></tr>';wz2BulkRender()}
+function wz2Sel(id,on){on?WZ2sel.add(id):WZ2sel.delete(id);wz2BulkRender()}
+function wz2SelAll(on){WZ2it.slice(0,400).forEach(r=>on?WZ2sel.add(r.id):WZ2sel.delete(r.id));wz2ItemsRender()}
+async function wz2BulkDo(b){try{const r=await api('/api/wz2/items/bulk',{method:'POST',body:JSON.stringify({ids:[...WZ2sel],...b})});toast(r.message);await Promise.all([wz2Items(),wz2Refresh()])}catch(e){toast(e.message,true)}}
+async function wz2Refresh(){try{WZ2=await api('/api/wz2');const keep=WZsel;const sub=document.getElementById('wz2SubBody');document.querySelectorAll('#wizSteps .wst').forEach((el,i)=>{const s=WZ2.steps[i];el.querySelector('.wbd').className='wbd '+s.status;el.querySelector('.wbd').textContent=(WZ2ST[s.status]||s.status)+(s.note?' · '+s.note:'');el.querySelector('.wc').textContent=wz2Cnt(s)})}catch(e){}}
+function wz2Edit(id){const r=WZ2it.find(x=>x.id===id);if(!r)return;openModal(`<h2>${r.layer==='object'?'Объект':'Вид работ'} ${esc(r.layer==='work'?r.parent_key:r.key)}</h2>${r.layer==='object'?`<div class="field"><label>Шифр</label><input id="w2Key" value="${esc(r.key)}"></div>`:''}<div class="field"><label>Наименование</label><input id="w2Name" value="${esc(r.name)}"></div><div class="field"><label>${r.layer==='object'?'Вид объекта':'Код работы'}</label><input id="w2Kind" value="${esc(r.kind)}"></div><div class="pgrid"><div class="field"><label>Объём</label><input id="w2Qty" type="number" step="any" value="${r.qty??''}"></div><div class="field"><label>Ед.</label><input id="w2Unit" value="${esc(r.unit)}"></div></div><div class="field"><label>Статус объёма</label><select id="w2Scope">${Object.entries(WZ2.scopes).map(([k,v])=>`<option value="${k}" ${k===(r.scope||'')?'selected':''}>${esc(v)}</option>`).join('')}</select></div><div class="field"><label>Примечание</label><textarea id="w2Note">${esc(r.note)}</textarea></div>${r.marks?`<div class="notice">У пункта ${r.marks} отметок прораба — они сохранятся в истории.</div>`:''}<div class="dialogactions"><button class="btn" onclick="wz2HistItem('${r.id}')">История</button><button class="btn" onclick="closeModal()">Отмена</button><button class="btn primary" onclick="wz2EditSave('${r.id}','${r.layer}')">Сохранить</button></div>`)}
+async function wz2EditSave(id,layer){const g=k=>document.getElementById(k);const b={name:g('w2Name').value,kind:g('w2Kind').value,unit:g('w2Unit').value,note:g('w2Note').value,scope:g('w2Scope').value,layer};if(g('w2Key'))b.key=g('w2Key').value;if(g('w2Qty').value!=='')b.qty=+g('w2Qty').value;try{const r=await api('/api/wz2/items/'+encodeURIComponent(id),{method:'PUT',body:JSON.stringify(b)});closeModal();toast(r.message);await Promise.all([wz2Items(),wz2Refresh()])}catch(e){toast(e.message,true)}}
+function wz2Add(){const isW=WZ2f.layer==='work';openModal(`<h2>${isW?'Новый вид работ':'Новый объект'}</h2>${isW?`<div class="field"><label>Объект (шифр)</label><input id="w2Par" placeholder="К2-10"></div>`:''}<div class="field"><label>${isW?'Код работы (латиницей, напр. pit)':'Шифр'}</label><input id="w2Key"></div><div class="field"><label>Наименование</label><input id="w2Name"></div><div class="field"><label>${isW?'Код (как в перечне)':'Вид объекта'}</label><input id="w2Kind"></div><div class="dialogactions"><button class="btn" onclick="closeModal()">Отмена</button><button class="btn primary" onclick="wz2AddSave()">Добавить</button></div>`)}
+async function wz2AddSave(){const g=k=>document.getElementById(k)?.value||'';const isW=WZ2f.layer==='work';const b={layer:WZ2f.layer,key:g('w2Key'),name:g('w2Name'),kind:g('w2Kind')||(isW?g('w2Key'):'')};
+ try{if(isW){const d=await api('/api/wz2/items?'+new URLSearchParams({layer:'object',q:g('w2Par')}));const o=d.items.find(x=>x.key===g('w2Par').trim());if(!o)throw Error('Объект '+g('w2Par')+' не найден');b.parent_id=o.id}
+ const r=await api('/api/wz2/items',{method:'POST',body:JSON.stringify(b)});closeModal();toast(r.message);await Promise.all([wz2Items(),wz2Refresh()])}catch(e){toast(e.message,true)}}
+async function wz2GroupsLoad(){try{WZ2g=await api('/api/wz2/groups')}catch(e){toast(e.message,true);return}const box=document.getElementById('wz2Groups');if(!box)return;
+ box.innerHTML=`<div class="wact" style="margin:0 0 8px"><button class="btn small primary" onclick="wz2GroupNew()">+ группа</button></div><div class="grow ${WZ2f.group===''?'on':''}" onclick="WZ2f.group='';wz2GroupPick()"><b>Все объекты</b></div>${WZ2g.groups.map(g=>`<div class="grow ${WZ2f.group===g.id?'on':''}" onclick="WZ2f.group='${g.id}';wz2GroupPick()"><b>${esc(g.name)}</b> <span class="kind">${g.members} объект.${g.origin==='legacy'?' · из прежнего перечня':''}</span><span style="float:right"><a onclick="event.stopPropagation();wz2GroupRen('${g.id}')" title="Переименовать">✎</a> <a onclick="event.stopPropagation();wz2GroupDel('${g.id}')" title="Удалить группу">✕</a></span></div>`).join('')}<div class="kind" style="margin-top:8px">Объектов без группы: <b>${WZ2g.ungrouped_objects}</b></div>`;wz2GroupPick(true)}
+function wz2GroupPick(noReload){document.querySelectorAll('#wz2Groups .grow').forEach(x=>x.classList.remove('on'));const box=document.getElementById('wz2SubBody');
+ box.innerHTML=`<div class="wact" style="margin:0 0 8px"><input class="wscope" style="width:220px" placeholder="поиск" value="${esc(WZ2f.q)}" onchange="WZ2f.q=this.value;wz2Items()"><span class="kind" style="align-self:center">${WZ2f.group?'Объекты группы':'Все объекты раздела'} — выделите и перенесите «в группу…»</span></div><div class="wact" id="wz2Bulk" style="margin:0 0 8px"></div><div class="tablewrap" style="max-height:52vh;overflow:auto"><table class="table" style="min-width:700px"><thead id="wz2Head"></thead><tbody id="wz2Body"></tbody></table></div>`;wz2Items();if(!noReload)wz2GroupsLoad()}
+async function wz2GroupNew(){const n=prompt('Название группы (например: Колодец К2-10, Узел задвижек У-1, Секция пожаротушения 2)');if(!n)return;try{await api('/api/wz2/groups',{method:'POST',body:JSON.stringify({name:n})});await Promise.all([wz2GroupsLoad(),wz2Refresh()])}catch(e){toast(e.message,true)}}
+async function wz2GroupRen(id){const g=WZ2g.groups.find(x=>x.id===id);const n=prompt('Новое название',g.name);if(!n)return;try{await api('/api/wz2/groups/'+id,{method:'PUT',body:JSON.stringify({name:n,kind:g.kind,parent_id:g.parent_id,note:g.note})});await Promise.all([wz2GroupsLoad(),wz2Refresh()])}catch(e){toast(e.message,true)}}
+async function wz2GroupDel(id){if(!confirm('Удалить группу? Объекты останутся, но без группы.'))return;try{const r=await api('/api/wz2/groups/'+id,{method:'DELETE'});toast(r.message);if(WZ2f.group===id)WZ2f.group='';await Promise.all([wz2GroupsLoad(),wz2Refresh()])}catch(e){toast(e.message,true)}}
+async function wz2Confirm(step,action){try{const r=await api('/api/wz2/confirm',{method:'POST',body:JSON.stringify({step,action:action||'done'})});WZ2=r.state;const p=r.published||{};const n=Object.values(p).reduce((a,b)=>a+b,0);toast(step.includes('.')?'Подшаг отмечен':'Шаг '+step+' подтверждён'+(n?'; в перечне изменено: '+Object.entries(p).map(([k,v])=>({el_added:'добавлено объектов',el_changed:'изменено объектов',el_disabled:'выведено из перечня',op_added:'добавлено работ',op_changed:'изменено работ',op_removed:'удалено работ',op_kept_marked:'оставлено работ с отметками'}[k]||k)+' '+v).join(', '):'; перечень без изменений'));await wizLoad();load()}catch(e){toast(e.message,true)}}
+function wz2Journal(step,mode){const S=WZ2.snapshots.filter(x=>!step||x.step===step);const kindRu={migration:'миграция',confirm:'подтверждение','before-rollback':'перед откатом'};
+ openModal(`<div class="wz2wide"><h2>Снимки${step?' шага '+step:''} и откат</h2><p class="sub" style="margin:0 0 10px">Снимок сохраняется при каждом подтверждении и перед каждым откатом — откат тоже можно отменить. ${mode==='items'?`<b>Частичный откат: выделено ${WZ2sel.size} пунктов.</b>`:WZ2f.group&&step===2?'':''}</p>
+ <div class="field"><label>Что откатить</label><select id="rbMode"><option value="full">весь шаг</option><option value="items" ${mode==='items'?'selected':''} ${WZ2sel.size?'':'disabled'}>только выделенные пункты (${WZ2sel.size})</option><option value="group" ${WZ2f.group?'':'disabled'}>только выбранную группу</option></select></div>
+ <div class="tablewrap" style="max-height:40vh;overflow:auto"><table class="table" style="min-width:600px"><thead><tr><th>Когда</th><th>Шаг</th><th>Событие</th><th>Состав</th><th>Кто</th><th></th></tr></thead><tbody>${S.map(x=>{const st=JSON.parse(x.stats_json||'{}');return `<tr><td>${esc(fmtDT(x.at))}</td><td>${x.step}</td><td>${esc(kindRu[x.kind]||x.kind)}<div class="kind">${esc(x.reason)}</div></td><td class="kind">${x.step===1?`объектов ${st.objects||0}, работ ${st.works||0}`:`групп ${st.groups||0}`}</td><td class="kind">${esc(x.by)}</td><td><button class="btn small" onclick="wz2RbPreview('${x.id}')">Откатить к этому…</button></td></tr>`}).join('')||'<tr><td colspan="6" class="empty">Снимков нет</td></tr>'}</tbody></table></div><div id="rbBox"></div><div class="dialogactions"><button class="btn" onclick="closeModal()">Закрыть</button></div></div>`)}
+function wz2RbBody(id){return {snapshot_id:id,mode:document.getElementById('rbMode').value,ids:[...WZ2sel],group_id:WZ2f.group}}
+async function wz2RbPreview(id){try{const r=await api('/api/wz2/rollback',{method:'POST',body:JSON.stringify({...wz2RbBody(id),dry_run:true})});const c=r.counts;const box=document.getElementById('rbBox');
+ box.innerHTML=`<div class="hintbox" style="margin-top:10px"><b>Что изменится (снимок от ${esc(fmtDT(r.snapshot))}):</b> ${r.step===1?`вернётся пунктов ${c.add}, уберётся ${c.remove}, изменится ${c.change}`:`групп +${c.groups_add}/−${c.groups_remove}, привязок объектов +${c.members_add}/−${c.members_remove}`}.${r.marks||r.acts?`<div class="notice" style="margin:8px 0">Затронуто отметок прораба: <b>${r.marks}</b>, актов: <b>${r.acts}</b>. Отметки не удаляются — сохранятся в истории.<label style="display:block;margin-top:6px"><input type="checkbox" id="rbMarks"> Подтверждаю откат с отметками прораба</label></div>`:''}<div class="field"><label>Причина отката (обязательно)</label><input id="rbReason" placeholder="например: ошибка в перечне; переделка по требованию технадзора"></div><button class="btn primary" onclick="wz2RbDo('${id}')">Выполнить откат</button> <span class="kind">После отката подтвердите шаг заново — тогда изменения попадут к прорабу.</span></div>`}catch(e){toast(e.message,true)}}
+async function wz2RbDo(id){const m=document.getElementById('rbMarks');try{const r=await api('/api/wz2/rollback',{method:'POST',body:JSON.stringify({...wz2RbBody(id),reason:document.getElementById('rbReason').value,confirm_marks:!!(m&&m.checked)})});closeModal();toast(r.message);WZ2sel.clear();await wizLoad()}catch(e){toast(e.message,true)}}
+async function wz2Hist(item){try{const d=await api('/api/wz2/history'+(item?'?item='+encodeURIComponent(item):''));const ru={add:'добавлено',edit:'изменено',bulk:'массово',group:'группа','rollback-remove':'откат: убрано','rollback-restore':'откат: восстановлено',rollback:'откат',delete:'удалено'};
+ openModal(`<div class="wz2wide"><h2>Журнал изменений</h2><div class="tablewrap" style="max-height:60vh;overflow:auto"><table class="table" style="min-width:640px"><thead><tr><th>Когда</th><th>Действие</th><th>Что</th><th>Причина</th><th>Кто</th></tr></thead><tbody>${d.history.map(h=>{let a={},b={};try{a=JSON.parse(h.after_json||'{}')||{};b=JSON.parse(h.before_json||'{}')||{}}catch{}return `<tr><td>${esc(fmtDT(h.at))}</td><td>${esc(ru[h.action]||h.action)}</td><td class="kind">${esc((a.key||b.key||a.name||b.name||h.item_kind)+'')}${b.name&&a.name&&a.name!==b.name?' : '+esc(b.name)+' → '+esc(a.name):''}${b.state&&a.state&&a.state!==b.state?' : '+esc(WZ2STATE[b.state]||b.state)+' → '+esc(WZ2STATE[a.state]||a.state):''}</td><td class="kind">${esc(h.reason)}</td><td class="kind">${esc(h.by)}</td></tr>`}).join('')||'<tr><td colspan="5" class="empty">Изменений нет</td></tr>'}</tbody></table></div><div class="dialogactions"><button class="btn" onclick="closeModal()">Закрыть</button></div></div>`)}catch(e){toast(e.message,true)}}
+function wz2HistItem(id){closeModal();wz2Hist(id)}
 let LT='proj',LTF='un';
 async function listTabsLoad(){try{AL=await api('/api/alloc')}catch(e){const b=document.getElementById('ltBody');if(b)b.innerHTML='<tr><td class="empty">'+esc(e.message)+'</td></tr>';return}listTabsRender()}
 async function listTabsAuto(){try{const r=await api('/api/alloc/auto',{method:'POST'});toast(r.message);await listTabsLoad();if(curPage==='list')wizLoad()}catch(e){toast(e.message,true)}}
